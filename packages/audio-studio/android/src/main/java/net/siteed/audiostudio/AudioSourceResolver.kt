@@ -30,7 +30,7 @@ internal object AudioSourceResolver {
     /** What the caller asked for and what they actually got. */
     data class Resolution(
         val source: Int,
-        /** Stable name for the JS layer: mic, voiceRecognition, unprocessed. */
+        /** Stable name for the JS layer: mic, voiceRecognition, voiceCommunication, unprocessed. */
         val name: String,
         /** True when the requested source was unavailable and something else was used. */
         val fellBack: Boolean,
@@ -39,7 +39,8 @@ internal object AudioSourceResolver {
     private val MIC = Resolution(MediaRecorder.AudioSource.MIC, "mic", fellBack = false)
 
     /**
-     * @param requested one of mic, voiceRecognition, unprocessed, auto, or null for the default
+     * @param requested one of mic, voiceRecognition, voiceCommunication, unprocessed, auto,
+     * or null for the default
      * @param context used to query the platform's unprocessed-capture capability
      * @param sampleRate the rate recording will actually use
      * @param channelConfig `AudioFormat.CHANNEL_IN_*`
@@ -58,6 +59,12 @@ internal object AudioSourceResolver {
             "voiceRecognition" -> Resolution(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 "voiceRecognition",
+                fellBack = false,
+            )
+
+            "voiceCommunication" -> Resolution(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                "voiceCommunication",
                 fellBack = false,
             )
 

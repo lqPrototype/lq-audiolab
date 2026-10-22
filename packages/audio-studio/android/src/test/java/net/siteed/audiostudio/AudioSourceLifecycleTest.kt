@@ -49,13 +49,13 @@ class AudioSourceLifecycleTest {
     @Test
     fun `pause then resume keeps the source`() {
         val lifecycle = AudioSourceLifecycle<String>()
-        val resolver = Resolver("voiceRecognition", "mic")
+        val resolver = Resolver("voiceCommunication", "mic")
 
         lifecycle.onInitializeRecorders(resolver::next)
         // Resume rebuilds the PCM recorder; the compressed one was never released.
         lifecycle.onInitializeRecorders(resolver::next)
 
-        assertEquals("voiceRecognition", lifecycle.resolved)
+        assertEquals("voiceCommunication", lifecycle.resolved)
         assertEquals(1, resolver.calls)
     }
 
@@ -118,7 +118,7 @@ class AudioSourceLifecycleTest {
     @Test
     fun `a full session resolves once per recording`() {
         val lifecycle = AudioSourceLifecycle<String>()
-        val resolver = Resolver("unprocessed", "voiceRecognition")
+        val resolver = Resolver("unprocessed", "voiceCommunication")
 
         // prepare -> start -> device change -> pause -> resume -> stop
         lifecycle.onInitializeRecorders(resolver::next)
@@ -131,7 +131,7 @@ class AudioSourceLifecycleTest {
 
         // A second recording asking for something else gets it.
         lifecycle.onInitializeRecorders(resolver::next)
-        assertEquals("voiceRecognition", lifecycle.resolved)
+        assertEquals("voiceCommunication", lifecycle.resolved)
         assertEquals(2, resolver.calls)
     }
 }

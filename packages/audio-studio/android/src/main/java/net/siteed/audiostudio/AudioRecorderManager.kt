@@ -149,6 +149,8 @@ class AudioRecorderManager(
      * fallback (#428). See [AudioSourceLifecycle] for when it is resolved and dropped.
      */
     private val audioSourceLifecycle = AudioSourceLifecycle<AudioSourceResolver.Resolution>()
+    /** Platform AEC/ANS/AGC attached to the current VOICE_COMMUNICATION AudioRecord session. */
+    private var voiceProcessingEffects: VoiceProcessingEffects? = null
 
     /**
      * The resolved source, for use after the recorders exist. Reading this before resolution
@@ -535,6 +537,7 @@ class AudioRecorderManager(
                     LogUtils.d(CLASS_NAME, "🔄 handleDeviceChange: Recording is paused, marking for restart with new device when resumed")
                     // Capture ownership before release so a throwing release cannot report
                     // failure against a session that resumes in the recovery gap.
+                    releaseVoiceProcessingEffects()
                     audioRecord?.release()
                     audioRecord = null
                     return DeviceTransitionResult.Cancelled
@@ -564,6 +567,7 @@ class AudioRecorderManager(
                     compressedRecorder?.pause()
                     compressedPausedForDeviceChangeSession.set(claimedSession)
                 }
+                releaseVoiceProcessingEffects()
                 audioRecord?.release()
                 audioRecord = null
                 LogUtils.d(CLASS_NAME, "🔄 AudioRecord resources released")
@@ -784,6 +788,7 @@ class AudioRecorderManager(
 
     private fun releaseAudioRecordForDisconnectedRoute() {
         try {
+            releaseVoiceProcessingEffects()
             audioRecord?.release()
         } finally {
             audioRecord = null
@@ -1452,6 +1457,7 @@ class AudioRecorderManager(
      * nothing here belongs to an active recording.
      */
     private fun discardFailedAttempt() {
+        releaseVoiceProcessingEffects()
         audioRecord?.let { record ->
             try {
                 record.release()
@@ -1556,6 +1562,19 @@ class AudioRecorderManager(
                         null
                     )
                     return false
+                }
+
+                // VOICE_COMMUNICATION selects the device's communication capture path, but
+                // that alone did not attach any effects on the Lenovo/Qualcomm target (the
+                // AudioFlinger dump showed 0 Effect Chains). Bind each available platform
+                // AEC/ANS/AGC effect to this concrete AudioRecord session so the system has
+                // an explicit chain. A route change or interruption creates a new session
+                // and reaches this block again; teardown releases the previous chain first.
+                releaseVoiceProcessingEffects()
+                if (currentSource.name == "voiceCommunication") {
+                    voiceProcessingEffects = VoiceProcessingEffects.attach(
+                        checkNotNull(audioRecord).audioSessionId
+                    )
                 }
             }
             return true
@@ -1865,6 +1884,7 @@ class AudioRecorderManager(
                 LogUtils.e(CLASS_NAME, "Error reading from AudioRecord", e)
             } finally {
                 releaseWakeLock()
+                releaseVoiceProcessingEffects()
                 audioRecord?.release()
             }
 
@@ -2882,6 +2902,7 @@ class AudioRecorderManager(
                 releaseWakeLock()
                 releaseAudioFocus()
                 unregisterPhoneStateListener()
+                releaseVoiceProcessingEffects()
                 audioRecord?.release()
                 audioRecord = null
                 
@@ -2922,6 +2943,11 @@ class AudioRecorderManager(
             }
         }
         return true
+    }
+
+    private fun releaseVoiceProcessingEffects() {
+        voiceProcessingEffects?.release()
+        voiceProcessingEffects = null
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)

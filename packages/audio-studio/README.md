@@ -1,9 +1,4 @@
-# @siteed/audio-studio
-
-[![Version](https://img.shields.io/npm/v/@siteed/audio-studio.svg)](https://www.npmjs.com/package/@siteed/audio-studio)
-[![Downloads](https://img.shields.io/npm/dt/@siteed/audio-studio.svg)](https://www.npmjs.com/package/@siteed/audio-studio)
-[![License](https://img.shields.io/npm/l/@siteed/audio-studio.svg)](https://www.npmjs.com/package/@siteed/audio-studio)
-[![GitHub stars](https://img.shields.io/github/stars/deeeed/audiolab.svg?style=social&label=Star)](https://github.com/deeeed/audiolab)
+> Fork: https://github.com/deeeed/audiolab
 
 **Give it a GitHub star, if you found this repo useful.**
 
@@ -48,13 +43,13 @@ Cross-platform audio recording, analysis, and processing for React Native and Ex
 ## Install
 
 ```bash
-yarn add @siteed/audio-studio
+yarn add @maiyuesfot/audio-studio
 ```
 
 ## Quick Start
 
 ```typescript
-import { useAudioRecorder } from '@siteed/audio-studio'
+import { useAudioRecorder } from '@maiyuesfot/audio-studio'
 
 const { startRecording, stopRecording, isRecording } = useAudioRecorder()
 
@@ -184,7 +179,7 @@ import {
     extractPreview,
     extractMelSpectrogram,
     trimAudio,
-} from '@siteed/audio-studio'
+} from '@maiyuesfot/audio-studio'
 
 // Feature extraction
 const analysis = await extractAudioAnalysis({
@@ -244,7 +239,7 @@ For UI waveform previews, prefer `extractPreviewBars` over adapting a full
 `AudioAnalysis` when detailed features are not needed:
 
 ```typescript
-import { extractPreviewBars } from '@siteed/audio-studio'
+import { extractPreviewBars } from '@maiyuesfot/audio-studio'
 
 const preview = await extractPreviewBars({
     fileUri,

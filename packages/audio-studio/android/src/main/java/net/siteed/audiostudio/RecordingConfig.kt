@@ -65,7 +65,7 @@ data class RecordingConfig(
     val deviceId: String? = null,
     val deviceDisconnectionBehavior: String? = null,
     val audioFocusStrategy: String? = null,
-    /** Requested MediaRecorder.AudioSource: mic, voiceRecognition, unprocessed, auto. */
+    /** Requested MediaRecorder.AudioSource: mic, voiceRecognition, voiceCommunication, unprocessed, auto. */
     val audioSource: String? = null,
     val bufferDurationSeconds: Double? = null,
     val streamFormat: String = "raw",

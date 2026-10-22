@@ -194,7 +194,11 @@ export interface StartRecordingResult {
      * example `'unprocessed'` on a device that does not support it falls back to `'mic'`.
      * Check this rather than assuming the requested source was used.
      */
-    androidAudioSource?: 'mic' | 'voiceRecognition' | 'unprocessed'
+    androidAudioSource?:
+        | 'mic'
+        | 'voiceRecognition'
+        | 'voiceCommunication'
+        | 'unprocessed'
     /** Information about compression if enabled, including the URI to the compressed file */
     compression?: CompressionInfo & {
         /** URI to the compressed audio file */
@@ -305,21 +309,30 @@ export interface AndroidConfig {
      *
      * - `'mic'`: the device's primary microphone, with whatever processing the OEM applies
      * - `'voiceRecognition'`: tuned for ASR; usually skips AGC and aggressive noise suppression
+     * - `'voiceCommunication'`: tuned for calls/meetings. The Android recorder explicitly
+     *   enables every system AEC, noise suppressor, and AGC effect the device exposes for
+     *   the capture session; unsupported effects are skipped without failing recording
      * - `'unprocessed'`: raw capture with no processing. Requires hardware support —
      *   Android treats it as `DEFAULT` on devices without it, so support is checked via
      *   `PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED` and falls back to `'mic'`
      * - `'auto'`: `'unprocessed'` where supported, otherwise `'voiceRecognition'`
      *
-     * Only `'unprocessed'` can fall back; `'mic'` and `'voiceRecognition'` are available
-     * everywhere. Because `'auto'` resolves per device, prefer an explicit value when you
-     * need consistent behaviour across a fleet.
+     * Only `'unprocessed'` can fall back; the other explicit sources are Android platform
+     * sources. The actual 3A effects available for `'voiceCommunication'` remain
+     * device/OEM-dependent. Because `'auto'` resolves per device, prefer an explicit value
+     * when you need consistent behaviour across a fleet.
      *
      * The resolved source is reported on the recording result as `androidAudioSource`, so
      * you can tell whether a fallback happened rather than assuming the request was honoured.
      *
      * @default 'mic'
      */
-    audioSource?: 'mic' | 'voiceRecognition' | 'unprocessed' | 'auto'
+    audioSource?:
+        | 'mic'
+        | 'voiceRecognition'
+        | 'voiceCommunication'
+        | 'unprocessed'
+        | 'auto'
 }
 
 /** Web platform specific configuration options */

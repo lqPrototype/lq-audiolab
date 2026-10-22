@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.0.0] - 2026-10-21
+
+### Added
+
+- Android `audioSource: 'voiceCommunication'` now opens `VOICE_COMMUNICATION` capture and explicitly attaches every available platform AEC, noise-suppression, and automatic-gain-control effect to the `AudioRecord` session. Each effect is checked and enabled independently, logged with its OEM implementation, released before the recorder, and safely skipped when unsupported or rejected by the device. Effects are reattached when Android rebuilds capture after a route change or interruption.
 
 ## [4.0.0-beta.0] - 2026-08-24
 
