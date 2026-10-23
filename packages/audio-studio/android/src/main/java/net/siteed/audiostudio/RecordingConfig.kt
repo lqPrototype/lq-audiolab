@@ -4,6 +4,43 @@ import android.media.AudioFormat
 import android.os.Build
 import java.io.File
 
+enum class AndroidAudioProcessingMode(val wireValue: String) {
+    SYSTEM("system"),
+    SYSTEM_WITH_SOFTWARE_FALLBACK("systemWithSoftwareFallback"),
+    SOFTWARE("software");
+
+    companion object {
+        fun fromWireValue(value: String): AndroidAudioProcessingMode =
+            entries.firstOrNull { it.wireValue == value }
+                ?: throw IllegalArgumentException(
+                    "android.audioProcessing.mode must be system, systemWithSoftwareFallback, or software"
+                )
+    }
+}
+
+data class AndroidAudioProcessingConfig(
+    val mode: AndroidAudioProcessingMode = AndroidAudioProcessingMode.SYSTEM_WITH_SOFTWARE_FALLBACK,
+    val echoCancellation: Boolean = true,
+    val noiseSuppression: Boolean = true,
+    val automaticGainControl: Boolean = true,
+) {
+    companion object {
+        fun fromValue(value: Any?): AndroidAudioProcessingConfig? {
+            if (value == null) return null
+            val map = value as? Map<*, *>
+                ?: throw IllegalArgumentException("android.audioProcessing must be an object")
+            val mode = (map["mode"] as? String)?.let(AndroidAudioProcessingMode::fromWireValue)
+                ?: AndroidAudioProcessingMode.SYSTEM_WITH_SOFTWARE_FALLBACK
+            return AndroidAudioProcessingConfig(
+                mode = mode,
+                echoCancellation = map["echoCancellation"] as? Boolean ?: true,
+                noiseSuppression = map["noiseSuppression"] as? Boolean ?: true,
+                automaticGainControl = map["automaticGainControl"] as? Boolean ?: true,
+            )
+        }
+    }
+}
+
 // New output configuration structure
 data class OutputConfig(
     val primary: PrimaryOutput = PrimaryOutput(),
@@ -67,6 +104,8 @@ data class RecordingConfig(
     val audioFocusStrategy: String? = null,
     /** Requested MediaRecorder.AudioSource: mic, voiceRecognition, voiceCommunication, unprocessed, auto. */
     val audioSource: String? = null,
+    /** Android platform 3A and WebRTC APM fallback policy. */
+    val audioProcessing: AndroidAudioProcessingConfig? = null,
     val bufferDurationSeconds: Double? = null,
     val streamFormat: String = "raw",
     val maxDurationMs: Long = 0L,
@@ -148,6 +187,11 @@ data class RecordingConfig(
             val androidConfig = options["android"] as? Map<String, Any>
             val audioFocusStrategy = androidConfig?.get("audioFocusStrategy") as? String
             val audioSource = androidConfig?.get("audioSource") as? String
+            val audioProcessing = try {
+                AndroidAudioProcessingConfig.fromValue(androidConfig?.get("audioProcessing"))
+            } catch (error: IllegalArgumentException) {
+                return Result.failure(error)
+            }
 
             // Initialize the recording configuration with cleaned directory path
             val tempRecordingConfig = RecordingConfig(
@@ -176,6 +220,7 @@ data class RecordingConfig(
                 deviceDisconnectionBehavior = deviceDisconnectionBehavior,
                 audioFocusStrategy = audioFocusStrategy,
                 audioSource = audioSource,
+                audioProcessing = audioProcessing,
                 bufferDurationSeconds = (options["bufferDurationSeconds"] as? Number)?.toDouble(),
                 streamFormat = options.getStringOrDefault("streamFormat", "raw"),
                 maxDurationMs = options.getNumberOrDefault("maxDurationMs", 0L),

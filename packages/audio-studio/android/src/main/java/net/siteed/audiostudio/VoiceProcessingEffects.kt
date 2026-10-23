@@ -16,6 +16,7 @@ import android.media.audiofx.NoiseSuppressor
  */
 internal class VoiceProcessingEffects private constructor(
     private val effects: List<AudioEffect>,
+    val status: SystemAudioProcessingStatus,
 ) {
     fun release() {
         effects.asReversed().forEach { effect ->
@@ -30,20 +31,23 @@ internal class VoiceProcessingEffects private constructor(
     companion object {
         private const val CLASS_NAME = "VoiceProcessingEffects"
 
-        fun attach(audioSessionId: Int): VoiceProcessingEffects {
+        fun attach(
+            audioSessionId: Int,
+            request: AudioProcessingRequest = AudioProcessingRequest(true, true, true),
+        ): VoiceProcessingEffects {
             val attached = mutableListOf<AudioEffect>()
 
-            attachEffect(
+            if (request.echoCancellation) attachEffect(
                 label = "AEC",
                 available = AcousticEchoCanceler.isAvailable(),
                 create = { AcousticEchoCanceler.create(audioSessionId) },
             )?.let(attached::add)
-            attachEffect(
+            if (request.noiseSuppression) attachEffect(
                 label = "ANS",
                 available = NoiseSuppressor.isAvailable(),
                 create = { NoiseSuppressor.create(audioSessionId) },
             )?.let(attached::add)
-            attachEffect(
+            if (request.automaticGainControl) attachEffect(
                 label = "AGC",
                 available = AutomaticGainControl.isAvailable(),
                 create = { AutomaticGainControl.create(audioSessionId) },
@@ -56,7 +60,14 @@ internal class VoiceProcessingEffects private constructor(
                     "ANS=${hasType(attached, NoiseSuppressor::class.java)}, " +
                     "AGC=${hasType(attached, AutomaticGainControl::class.java)})"
             )
-            return VoiceProcessingEffects(attached)
+            return VoiceProcessingEffects(
+                effects = attached,
+                status = SystemAudioProcessingStatus(
+                    aec = hasType(attached, AcousticEchoCanceler::class.java),
+                    noiseSuppression = hasType(attached, NoiseSuppressor::class.java),
+                    automaticGainControl = hasType(attached, AutomaticGainControl::class.java),
+                )
+            )
         }
 
         private fun attachEffect(

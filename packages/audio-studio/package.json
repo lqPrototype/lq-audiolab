@@ -1,6 +1,6 @@
 {
     "name": "lq-audio-studio",
-    "version": "4.0.0",
+    "version": "4.0.2",
     "description": "Comprehensive audio processing library for React Native and Expo with recording, analysis, visualization, and streaming capabilities across iOS, Android, and web",
     "license": "MIT",
     "type": "commonjs",
@@ -11,14 +11,14 @@
         "plugin": "./app.plugin.js"
     },
     "author": "Arthur Breton <abreton@siteed.net> (https://github.com/deeeed)",
-    "homepage": "https://github.com/deeeed/audiolab/blob/main/packages/audio-studio/README.md",
+    "homepage": "https://github.com/lqPrototype/lq-audiolab",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/deeeed/audiolab.git",
+        "url": "git+https://github.com/lqPrototype/lq-audiolab.git",
         "directory": "packages/audio-studio"
     },
     "bugs": {
-        "url": "https://github.com/deeeed/audiolab/issues"
+        "url": "https://github.com/lqPrototype/lq-audiolab/issues"
     },
     "keywords": [
         "react-native",

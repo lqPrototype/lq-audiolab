@@ -151,6 +151,10 @@ class AudioRecorderManager(
     private val audioSourceLifecycle = AudioSourceLifecycle<AudioSourceResolver.Resolution>()
     /** Platform AEC/ANS/AGC attached to the current VOICE_COMMUNICATION AudioRecord session. */
     private var voiceProcessingEffects: VoiceProcessingEffects? = null
+    /** WebRTC APM processing only the effects the platform session could not enable. */
+    private var softwareAudioProcessor: WebRtcAudioFrameProcessor? = null
+    private var audioProcessingConfigInUse: AndroidAudioProcessingConfig? = null
+    private var systemAudioProcessingStatus = SystemAudioProcessingStatus()
 
     /**
      * The resolved source, for use after the recorders exist. Reading this before resolution
@@ -1113,6 +1117,7 @@ class AudioRecorderManager(
                     // The source actually opened, which may differ from the request when the
                     // device does not support it (#428).
                     "androidAudioSource" to requireAudioSource.name,
+                    "audioProcessing" to currentAudioProcessingStatus().toMap(),
                     "compression" to if (compressedFile != null) bundleOf(
                         "mimeType" to if (recordingConfig.output.compressed.format == "aac") "audio/aac" else "audio/opus",
                         "bitrate" to recordingConfig.output.compressed.bitrate,
@@ -1564,18 +1569,13 @@ class AudioRecorderManager(
                     return false
                 }
 
-                // VOICE_COMMUNICATION selects the device's communication capture path, but
-                // that alone did not attach any effects on the Lenovo/Qualcomm target (the
-                // AudioFlinger dump showed 0 Effect Chains). Bind each available platform
-                // AEC/ANS/AGC effect to this concrete AudioRecord session so the system has
-                // an explicit chain. A route change or interruption creates a new session
-                // and reaches this block again; teardown releases the previous chain first.
+                // Rebuild the complete processing chain with each AudioRecord session. USB
+                // route changes and interruption recovery replace the Android session ID.
                 releaseVoiceProcessingEffects()
-                if (currentSource.name == "voiceCommunication") {
-                    voiceProcessingEffects = VoiceProcessingEffects.attach(
-                        checkNotNull(audioRecord).audioSessionId
-                    )
-                }
+                configureAudioProcessing(
+                    currentSourceName = currentSource.name,
+                    audioSessionId = checkNotNull(audioRecord).audioSessionId,
+                )
             }
             return true
 
@@ -2174,7 +2174,8 @@ class AudioRecorderManager(
                     "isPaused" to false,
                     "mime" to mimeType,
                     "size" to 0,
-                    "interval" to if (::recordingConfig.isInitialized) recordingConfig.interval else 0
+                    "interval" to if (::recordingConfig.isInitialized) recordingConfig.interval else 0,
+                    "audioProcessing" to currentAudioProcessingStatus().toMap(),
                 )
             }
 
@@ -2226,6 +2227,7 @@ class AudioRecorderManager(
                 "interval" to recordingConfig.interval,
                 "maxDurationMs" to if (recordingConfig.maxDurationMs > 0) recordingConfig.maxDurationMs else null,
                 "maxDurationReached" to maxDurationReached,
+                "audioProcessing" to currentAudioProcessingStatus().toMap(),
                 "compression" to compressionBundle
             )
         }
@@ -2317,6 +2319,9 @@ class AudioRecorderManager(
             } else {
                 null
             }
+            // Keep the analysis accumulator in the same scope as the APM tail flush.
+            // Otherwise the final partial capture frame cannot be forwarded to analysis.
+            val accumulatedAnalysisData = ByteArrayOutputStream()
             
             try {
                 // Write audio data directly to the file (if not skipping)
@@ -2325,7 +2330,6 @@ class AudioRecorderManager(
                 
                 // Buffer to accumulate data
                 accumulatedAudioData = ByteArrayOutputStream()
-                val accumulatedAnalysisData = ByteArrayOutputStream()  // Separate buffer for analysis
                 audioFileHandler.writeWavHeader(
                     accumulatedAudioData!!,
                     recordingConfig.sampleRate,
@@ -2380,6 +2384,7 @@ class AudioRecorderManager(
                     shouldProcessAnalysis = recordingConfig.enableProcessing && 
                         (isFirstAnalysis || timeSinceLastAnalysis >= recordingConfig.intervalAnalysis)
 
+                    var processedAudioData: ByteArray? = null
                     val bytesRead = synchronized(audioRecordLock) {
                         if (
                             sessionId != recordingSession ||
@@ -2429,26 +2434,31 @@ class AudioRecorderManager(
                                     // budget left and its next failure silently suppressed.
                                     failedDeliveryAttempts.remove(RecordingErrorKind.INPUT_READ)
                                     failedDeliveryAttempts.remove(RecordingErrorKind.INPUT_STATE)
+                                    processedAudioData = softwareAudioProcessor
+                                        ?.processCapture(audioData, bytes)
+                                        ?: audioData.copyOf(bytes)
                                 }
                             }
                         } ?: -1 // Handle null case
                     }
 
-                    if (bytesRead > 0) {
+                    val processedChunk = processedAudioData
+                    if (bytesRead > 0 && processedChunk != null && processedChunk.isNotEmpty()) {
+                        val processedBytesRead = processedChunk.size
                         // Only write to file if primary output is enabled
                         if (fos != null) {
-                            fos.write(audioData, 0, bytesRead)
-                            cachedPrimaryFileSize += bytesRead  // Update cached file size
+                            fos.write(processedChunk, 0, processedBytesRead)
+                            cachedPrimaryFileSize += processedBytesRead  // Update cached file size
                         }
-                        totalDataSize += bytesRead
+                        totalDataSize += processedBytesRead
                         
-                        accumulatedAudioData?.write(audioData, 0, bytesRead)
+                        accumulatedAudioData?.write(processedChunk, 0, processedBytesRead)
                         
                         // Always accumulate data for analysis if enabled (moved outside shouldProcessAnalysis check)
                         if (recordingConfig.enableProcessing) {
                             // Check buffer size to prevent OOM on low-RAM devices with extreme configs
-                            if (accumulatedAnalysisData.size() + bytesRead <= MAX_ANALYSIS_BUFFER_SIZE) {
-                                accumulatedAnalysisData.write(audioData, 0, bytesRead)
+                            if (accumulatedAnalysisData.size() + processedBytesRead <= MAX_ANALYSIS_BUFFER_SIZE) {
+                                accumulatedAnalysisData.write(processedChunk, 0, processedBytesRead)
                             } else {
                                 LogUtils.w(CLASS_NAME, "Analysis buffer size limit reached (${accumulatedAnalysisData.size()} bytes). Skipping data to prevent OOM.")
                             }
@@ -2521,6 +2531,23 @@ class AudioRecorderManager(
                     }
                 }
             } finally {
+                // APM retains fewer than 10 ms while completing its next frame. Preserve
+                // that raw tail on stop instead of shortening the recording or padding it.
+                val processingTail = synchronized(audioRecordLock) {
+                    softwareAudioProcessor?.flushCapture() ?: ByteArray(0)
+                }
+                if (processingTail.isNotEmpty()) {
+                    fos?.write(processingTail)
+                    if (fos != null) cachedPrimaryFileSize += processingTail.size
+                    totalDataSize += processingTail.size
+                    accumulatedAudioData?.write(processingTail)
+                    if (
+                        recordingConfig.enableProcessing &&
+                        accumulatedAnalysisData.size() + processingTail.size <= MAX_ANALYSIS_BUFFER_SIZE
+                    ) {
+                        accumulatedAnalysisData.write(processingTail)
+                    }
+                }
                 // Flush and close the file output stream if it was opened
                 try {
                     fos?.flush()
@@ -2948,6 +2975,104 @@ class AudioRecorderManager(
     private fun releaseVoiceProcessingEffects() {
         voiceProcessingEffects?.release()
         voiceProcessingEffects = null
+        softwareAudioProcessor?.release()
+        softwareAudioProcessor = null
+        audioProcessingConfigInUse = null
+        systemAudioProcessingStatus = SystemAudioProcessingStatus()
+    }
+
+    private fun configureAudioProcessing(currentSourceName: String, audioSessionId: Int) {
+        val config = recordingConfig.audioProcessing
+            ?: if (currentSourceName == "voiceCommunication") AndroidAudioProcessingConfig() else null
+        if (config == null) return
+
+        audioProcessingConfigInUse = config
+        val requested = AudioProcessingRequest.from(config)
+        if (config.mode != AndroidAudioProcessingMode.SOFTWARE && requested.anyEnabled) {
+            voiceProcessingEffects = VoiceProcessingEffects.attach(audioSessionId, requested)
+            systemAudioProcessingStatus = checkNotNull(voiceProcessingEffects).status
+        }
+        val plan = AudioProcessingPlan.create(config, systemAudioProcessingStatus)
+        softwareAudioProcessor = WebRtcAudioFrameProcessor.create(
+            sampleRate = recordingConfig.sampleRate,
+            channels = recordingConfig.channels,
+            encoding = recordingConfig.encoding,
+            request = plan.software,
+        )
+        val status = currentAudioProcessingStatus()
+        LogUtils.i(
+            CLASS_NAME,
+            "3A selected mode=${status.mode} AEC=${status.aec.wireValue} " +
+                "NS=${status.noiseSuppression.wireValue} AGC=${status.automaticGainControl.wireValue} " +
+                "reverseStreamConnected=${status.reverseStreamConnected}"
+        )
+    }
+
+    private fun currentAudioProcessingStatus(): AudioProcessingStatus {
+        val config = audioProcessingConfigInUse
+            ?: return AudioProcessingStatus.disabled(
+                sampleRate = if (::recordingConfig.isInitialized) recordingConfig.sampleRate else 0,
+                channels = if (::recordingConfig.isInitialized) recordingConfig.channels else 0,
+            )
+        val requested = AudioProcessingRequest.from(config)
+        val software = softwareAudioProcessor
+        val softwareRequest = software?.request
+        val reverseStreamConnected = software?.reverseStreamConnected == true
+
+        fun backend(
+            requestedEffect: Boolean,
+            systemEnabled: Boolean,
+            softwareEnabled: Boolean,
+        ): AudioProcessingBackend = when {
+            !requestedEffect -> AudioProcessingBackend.DISABLED
+            systemEnabled -> AudioProcessingBackend.SYSTEM
+            software != null && software.operational && softwareEnabled -> AudioProcessingBackend.WEBRTC
+            else -> AudioProcessingBackend.UNAVAILABLE
+        }
+
+        return AudioProcessingStatus(
+            mode = config.mode.wireValue,
+            aec = backend(
+                requested.echoCancellation,
+                systemAudioProcessingStatus.aec,
+                // Creating AEC3 is not evidence that echo cancellation is active.
+                // It only becomes effective after real speaker PCM reaches the reverse stream.
+                softwareRequest?.echoCancellation == true && reverseStreamConnected,
+            ),
+            noiseSuppression = backend(
+                requested.noiseSuppression,
+                systemAudioProcessingStatus.noiseSuppression,
+                softwareRequest?.noiseSuppression == true,
+            ),
+            automaticGainControl = backend(
+                requested.automaticGainControl,
+                systemAudioProcessingStatus.automaticGainControl,
+                softwareRequest?.automaticGainControl == true,
+            ),
+            reverseStreamConnected = reverseStreamConnected,
+            sampleRate = recordingConfig.sampleRate,
+            channels = recordingConfig.channels,
+        )
+    }
+
+    /**
+     * A native playback path can feed exact speaker PCM here. A JS/Base64 10 ms API is
+     * intentionally not exposed because scheduler jitter makes AEC delay unreliable.
+     */
+    internal fun processPlaybackReference(
+        pcm16: ByteArray,
+        sampleRate: Int,
+        channels: Int,
+        delayMs: Int,
+    ): Boolean = synchronized(audioRecordLock) {
+        if (
+            !::recordingConfig.isInitialized ||
+            sampleRate != recordingConfig.sampleRate ||
+            channels != recordingConfig.channels
+        ) {
+            return@synchronized false
+        }
+        softwareAudioProcessor?.processReverse(pcm16, pcm16.size, delayMs) == true
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)

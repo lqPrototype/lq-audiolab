@@ -1,76 +1,39 @@
 # audiolab
 
-[![GitHub stars](https://img.shields.io/github/stars/deeeed/audiolab.svg?style=social&label=Star)](https://github.com/deeeed/audiolab)
-[![Sponsor](https://img.shields.io/github/sponsors/deeeed?label=Sponsor&logo=GitHub)](https://github.com/sponsors/deeeed)
+## Fork information
 
-Audio processing monorepo for React Native and Expo — recording, analysis, visualization, and on-device speech processing across iOS, Android, and web.
+This repository is a fork of the upstream [`deeeed/audiolab`](https://github.com/deeeed/audiolab) project.
 
-**Give it a GitHub star, if you found this repo useful.**
-[![GitHub stars](https://img.shields.io/github/stars/deeeed/audiolab.svg?style=social&label=Star&maxAge=2592000)](https://github.com/deeeed/audiolab)
+- Upstream repository: [https://github.com/deeeed/audiolab](https://github.com/deeeed/audiolab)
+- This fork: [https://github.com/lqPrototype/lq-audiolab](https://github.com/lqPrototype/lq-audiolab)
+- The fork-specific Android audio changes documented below are maintained primarily in the `lq-audio-studio` package. The original project attribution, documentation, and license remain intact.
 
-[![Sponsor this project](https://img.shields.io/github/sponsors/deeeed?label=Sponsor&logo=GitHub)](https://github.com/sponsors/deeeed)
+## Fork-specific changes
 
-<a href="https://star-history.dera.page/#deeeed/audiolab&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=deeeed/audiolab&type=date&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=deeeed/audiolab&type=date&legend=top-left" />
-    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=deeeed/audiolab&type=date&legend=top-left" />
-  </picture>
-</a>
+### [4.0.2] - 2026-10-23
 
-> Formerly `expo-audio-stream`. See [MIGRATION.md](./MIGRATION.md) for upgrade steps.
+#### Changed
 
-<div align="center">
-  <p><a href="https://deeeed.github.io/audiolab">https://deeeed.github.io/audiolab</a></p>
-</div>
+- Republished the Android 3A and WebRTC APM integration as version `4.0.2`; runtime behavior remains unchanged from `4.0.1`.
+- Documented the upstream fork origin and the maintained repository URL.
 
-## Packages
+### [4.0.1] - 2026-10-23
 
-| Package | Description |
-|---------|-------------|
-| [`@siteed/audio-studio`](packages/audio-studio/) | Core audio recording, analysis, and processing |
-| [`@siteed/audio-ui`](packages/audio-ui/) | Skia-based audio visualization components |
-| [`@siteed/react-native-essentia`](packages/react-native-essentia/) | Audio feature extraction via Essentia |
-| [`@siteed/sherpa-onnx.rn`](packages/sherpa-onnx.rn/) | On-device speech-to-text and text-to-speech |
-| [`@siteed/moonshine.rn`](packages/moonshine.rn/) | Moonshine speech transcription and intent recognition for iOS, Android, and web |
+#### Added
 
-## Apps
+- Added configurable Android 3A processing through `android.audioProcessing`. Callers can select `system`, `systemWithSoftwareFallback`, or `software` mode and independently enable echo cancellation, noise suppression, and automatic gain control.
+- Bundled an ARM64 WebRTC Audio Processing Module based on WebRTC Audio Processing 1.3. It provides AEC3, noise suppression, and AGC2 for mono PCM16 capture in 10 ms frames when the corresponding Android platform effect is unavailable or software processing is explicitly requested.
+- Added `audioProcessing` diagnostics to Android recording start results and status payloads. Each effect reports `disabled`, `system`, `webrtc`, or `unavailable`, together with the active sample rate, channel count, frame duration, and software-AEC reverse-stream state.
+- Added a native playback-reference entry point for software AEC. Software AEC is reported as active only after real speaker PCM reaches the WebRTC reverse stream; creating an AEC3 processor alone is not treated as successful echo cancellation.
 
-### Audio Playground
+#### Changed
 
-Full-featured demo app showcasing all packages — available on [App Store](https://apps.apple.com/app/audio-playground/id6739774966) and [Google Play](https://play.google.com/store/apps/details?id=net.siteed.audioplayground), or [try the web version](https://deeeed.github.io/audiolab/playground/).
+- Android `voiceCommunication` capture now defaults to `systemWithSoftwareFallback`: verified platform AEC/NS/AGC effects remain preferred, while only effects that failed to attach are delegated to WebRTC APM.
+- WebRTC software processing is applied before primary WAV writes, JS PCM streaming, and audio analysis so all three consumers receive the same processed PCM. Android `MediaRecorder` compressed output remains on its separate capture path and is explicitly reported as unprocessed.
+- Platform effects and WebRTC processors are rebuilt for each new `AudioRecord` session, including USB route changes and interruption recovery, and are released together during recorder teardown.
 
-<div align="center">
-  <a href="https://apps.apple.com/app/audio-playground/id6739774966">
-    <img src="https://developer.apple.com/app-store/marketing/guidelines/images/badge-download-on-the-app-store.svg" alt="App Store" height="40" />
-  </a>
-  <a href="https://play.google.com/store/apps/details?id=net.siteed.audioplayground">
-    <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Google Play" height="40" />
-  </a>
-</div>
+### [4.0.0] - 2026-10-21
 
-### Other Apps
+#### Added
 
-- **[Sherpa Voice](https://deeeed.github.io/audiolab/sherpa-voice/)** — on-device speech recognition and TTS
-- **[Essentia Demo](apps/essentia-demo/)** — audio analysis with Essentia
-- **[Minimal](apps/minimal/)** — bare-minimum integration example
-
-## Roadmap
-
-- [x] Dual audio stream (raw PCM + compressed)
-- [x] Call interruption handling
-- [x] On-device transcription via react-native-whisper
-- [x] Audio analysis in C++ (via react-native-essentia)
-- [x] Cross-platform device detection and selection
-- [x] Zero-latency recording (`prepareRecording` API)
-- [x] Sherpa-ONNX integration into audio-studio
-- [x] Speaker diarization example (in Sherpa Voice app)
-- [x] Custom VAD example app (integrated to audio playground)
-- [x] Cross-platform e2e validation for feature extraction
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-<sub>Created by [Arthur Breton](https://siteed.net)</sub>
+- Android `audioSource: 'voiceCommunication'` now opens `VOICE_COMMUNICATION` capture and explicitly attaches every available platform AEC, noise-suppression, and automatic-gain-control effect to the `AudioRecord` session. Each effect is checked and enabled independently, logged with its OEM implementation, released before the recorder, and safely skipped when unsupported or rejected by the device. Effects are reattached when Android rebuilds capture after a route change or interruption.

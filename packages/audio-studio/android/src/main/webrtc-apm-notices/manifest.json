@@ -1,0 +1,150 @@
+{
+  "platform": "android",
+  "source": {
+    "url": "https://github.com/helloooideeeeea/webrtc-audio-processing.git",
+    "commit": "f8efa8486ac0dd463fb84e4e99be2e072c28adb8",
+    "version": "1.3"
+  },
+  "dependencyLock": {
+    "source": {
+      "url": "https://github.com/helloooideeeeea/webrtc-audio-processing.git",
+      "commit": "f8efa8486ac0dd463fb84e4e99be2e072c28adb8",
+      "version": "1.3"
+    },
+    "abseil": {
+      "directory": "abseil-cpp-20230125.1",
+      "source_hash": "81311c17599b3712069ded20cca09a62ab0bf2a89dfa16993786c8782b7ed145",
+      "patch_hash": "112ee72052049d930396c2778fc1c6e184137905dd75d60a97dcfc386426610d"
+    },
+    "android": {
+      "ndk": "27.1.12297006",
+      "api": 28
+    },
+    "ios": {
+      "deploymentTarget": "14.0",
+      "architectures": [
+        "arm64"
+      ],
+      "deviceOnly": true
+    },
+    "harmony": {
+      "architecture": "arm64-v8a",
+      "sdkArchive": "commandline-tools-linux-x64-26.0.0.851.zip",
+      "sdkSha256": "ab604bd92721d5cbcafd154e6461d46b9f1b105e7b89eab04a9d046681198082"
+    }
+  },
+  "features": [
+    "AEC3",
+    "NS",
+    "AGC2",
+    "voice-detection"
+  ],
+  "runtimeValidation": "NOT RUN",
+  "utsValidation": "NOT RUN",
+  "checks": {
+    "arm64-v8a": {
+      "libaozora_apm.so": {
+        "machine": "AArch64",
+        "needed": [
+          "libc.so",
+          "libdl.so",
+          "liblog.so",
+          "libm.so"
+        ],
+        "linkage": "PASSED"
+      }
+    }
+  },
+  "licenses": [
+    "AUTHORS",
+    "COPYING",
+    "subprojects/abseil-cpp-20230125.1/AUTHORS",
+    "subprojects/abseil-cpp-20230125.1/LICENSE",
+    "subprojects/abseil-cpp-20230125.1/LICENSE.build",
+    "webrtc/LICENSE",
+    "webrtc/PATENTS",
+    "webrtc/common_audio/third_party/ooura/LICENSE",
+    "webrtc/common_audio/third_party/spl_sqrt_floor/LICENSE",
+    "webrtc/modules/third_party/fft/LICENSE",
+    "webrtc/third_party/pffft/LICENSE",
+    "webrtc/third_party/rnnoise/COPYING"
+  ],
+  "files": {
+    "README.md": {
+      "bytes": 7794,
+      "sha256": "b8b8acc272df16b4a497e713588cc8f1cc918119b6f28f966378617e88ece207"
+    },
+    "THIRD_PARTY_NOTICES.md": {
+      "bytes": 1528,
+      "sha256": "97bbccd06118ce8a9dd9348a59f0636cca4fb1fa82d3d7d33c62af847d748697"
+    },
+    "app-android/include/aozora_apm.h": {
+      "bytes": 1834,
+      "sha256": "277d83959341396aa1fa1f3a9cca8a11fc020685861c0635085bd0c0e2b90cc3"
+    },
+    "app-android/libs/arm64-v8a/libaozora_apm.so": {
+      "bytes": 720984,
+      "sha256": "35505f16f5d24279cae33facb5a19a08f31776c70668addde4c166546103e914"
+    },
+    "licenses/AUTHORS": {
+      "bytes": 181,
+      "sha256": "705caaeede8c3bc8c8e3f76489864a5b0575b42cb4a38091f88b9126c3e6628d"
+    },
+    "licenses/COPYING": {
+      "bytes": 1495,
+      "sha256": "9b79539028e216e813e152d45f5c1ed5fdd0554426ad50270fb03134e7082dac"
+    },
+    "licenses/android-ndk/NOTICE": {
+      "bytes": 522923,
+      "sha256": "4d5224d1c0b54ffa88b0dc0088191638fdbb7227835095dfb98f7f66b416a323"
+    },
+    "licenses/android-ndk/NOTICE.toolchain": {
+      "bytes": 806124,
+      "sha256": "cbe3237be53c0a819f8df6aac5358fdee848eee3b6571b4e2ca20767ebd7465e"
+    },
+    "licenses/subprojects/abseil-cpp-20230125.1/AUTHORS": {
+      "bytes": 295,
+      "sha256": "1fd39030c119b4c97014f59e0ad0ed65f23475bbdf55a52740f31eb82b34b4ee"
+    },
+    "licenses/subprojects/abseil-cpp-20230125.1/LICENSE": {
+      "bytes": 11361,
+      "sha256": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747"
+    },
+    "licenses/subprojects/abseil-cpp-20230125.1/LICENSE.build": {
+      "bytes": 1070,
+      "sha256": "7939f4c45423cec4a18236ad0a88570e33508dd7462e07b1038001f90ece65fb"
+    },
+    "licenses/webrtc/LICENSE": {
+      "bytes": 1511,
+      "sha256": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482"
+    },
+    "licenses/webrtc/PATENTS": {
+      "bytes": 1388,
+      "sha256": "01462e2068d1a04c2274f3389773014c14ed9bc3446b28303543bd3e3c064145"
+    },
+    "licenses/webrtc/common_audio/third_party/ooura/LICENSE": {
+      "bytes": 272,
+      "sha256": "25b7731b70c77ecd5f3bb19303fbaa99be18860f81d44f71da670fdcd04829db"
+    },
+    "licenses/webrtc/common_audio/third_party/spl_sqrt_floor/LICENSE": {
+      "bytes": 915,
+      "sha256": "41d791701e3e1c1073470403de7e342442d1e6a2af72681023b13a2f45f2125c"
+    },
+    "licenses/webrtc/modules/third_party/fft/LICENSE": {
+      "bytes": 1125,
+      "sha256": "6fdbabd2c95c5efc6f1e46175278239afb9343120a3022ed0e0cb04267a6aeb3"
+    },
+    "licenses/webrtc/third_party/pffft/LICENSE": {
+      "bytes": 2560,
+      "sha256": "867617bfc1d18efeb0e2d8b0667912037d0de866cb5a58489108ee7b2bdb5d28"
+    },
+    "licenses/webrtc/third_party/rnnoise/COPYING": {
+      "bytes": 2108,
+      "sha256": "c12b096f7895f751fc51e6f406e20086c7dcc97a87fb87499ed2844cb123716c"
+    },
+    "licenses/wrapper-LICENSE": {
+      "bytes": 1540,
+      "sha256": "89418fc938de5d5ef90cc92de717eceb8a442dfbe7160065865bfcc230a351e8"
+    }
+  }
+}

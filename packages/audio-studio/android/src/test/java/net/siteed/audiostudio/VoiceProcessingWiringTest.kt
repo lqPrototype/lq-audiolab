@@ -42,7 +42,8 @@ class VoiceProcessingWiringTest {
     fun `effects follow every rebuilt AudioRecord session`() {
         val manager = sourceFile("AudioRecorderManager.kt")
 
-        assertTrue(manager.contains("currentSource.name == \"voiceCommunication\""))
+        assertTrue(manager.contains("currentSourceName = currentSource.name"))
+        assertTrue(manager.contains("if (currentSourceName == \"voiceCommunication\") AndroidAudioProcessingConfig()"))
         assertTrue(manager.contains("VoiceProcessingEffects.attach("))
         assertTrue(manager.contains("checkNotNull(audioRecord).audioSessionId"))
         assertTrue(manager.contains("releaseVoiceProcessingEffects()"))

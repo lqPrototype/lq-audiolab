@@ -40,6 +40,29 @@ export interface AudioStreamStatus {
     maxDurationMs?: number
     /** Whether the current recording session has reached the configured maximum duration */
     maxDurationReached?: boolean
+    /** Android 3A backend selected for the active recording. */
+    audioProcessing?: AudioProcessingStatus
+}
+
+export type AudioProcessingBackend =
+    | 'disabled'
+    | 'system'
+    | 'webrtc'
+    | 'unavailable'
+
+export interface AudioProcessingStatus {
+    mode: 'disabled' | AndroidAudioProcessingMode
+    /** `webrtc` is reported only after the software AEC receives real speaker-reference PCM. */
+    aec: AudioProcessingBackend
+    noiseSuppression: AudioProcessingBackend
+    automaticGainControl: AudioProcessingBackend
+    /** A software AEC is not effective until real speaker PCM reaches its reverse stream. */
+    reverseStreamConnected: boolean
+    sampleRate: number
+    channels: number
+    frameDurationMs: 10
+    /** Currently false: Android MediaRecorder compression uses a separate capture path. */
+    compressedOutputProcessed: boolean
 }
 
 interface AudioDataEventBase {
@@ -199,6 +222,8 @@ export interface StartRecordingResult {
         | 'voiceRecognition'
         | 'voiceCommunication'
         | 'unprocessed'
+    /** Verifiable Android system/WebRTC 3A selection for this recording session. */
+    audioProcessing?: AudioProcessingStatus
     /** Information about compression if enabled, including the URI to the compressed file */
     compression?: CompressionInfo & {
         /** URI to the compressed audio file */
@@ -333,6 +358,28 @@ export interface AndroidConfig {
         | 'voiceCommunication'
         | 'unprocessed'
         | 'auto'
+
+    /**
+     * Android voice processing policy. When omitted, `voiceCommunication` uses
+     * `systemWithSoftwareFallback`; other sources keep their previous behavior.
+     *
+     * WebRTC software processing currently supports mono PCM16 at 16 or 48 kHz in this
+     * package's public sample-rate set. It processes primary WAV, JS PCM streaming, and
+     * analysis input. Compressed MediaRecorder output is a separate capture path.
+     */
+    audioProcessing?: AndroidAudioProcessingConfig
+}
+
+export type AndroidAudioProcessingMode =
+    | 'system'
+    | 'systemWithSoftwareFallback'
+    | 'software'
+
+export interface AndroidAudioProcessingConfig {
+    mode?: AndroidAudioProcessingMode
+    echoCancellation?: boolean
+    noiseSuppression?: boolean
+    automaticGainControl?: boolean
 }
 
 /** Web platform specific configuration options */
