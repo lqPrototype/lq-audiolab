@@ -3,18 +3,23 @@ package net.siteed.audiostudio
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbDevice
 import android.media.AudioDeviceInfo
+import android.media.AudioDeviceCallback
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.hardware.usb.UsbManager
 import android.util.Log
 import androidx.annotation.RequiresApi
@@ -22,8 +27,8 @@ import expo.modules.kotlin.Promise
 import net.siteed.audiostudio.LogUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Constants not available in all Android versions
@@ -63,6 +68,15 @@ class AudioDeviceManager(
         
         // Common channel configurations most devices support
         private val COMMON_CHANNEL_COUNTS = listOf(1, 2)
+
+        // USB broadcasts and AudioDeviceCallback may describe one route change.
+        // Coalesce them briefly while using AudioDeviceCallback as the source of truth.
+        private const val USB_DEVICE_CHANGE_DEBOUNCE_MS = 120L
+        // Lenovo briefly removes and re-adds the same wired route with a new
+        // AudioDeviceInfo id when Bluetooth A2DP/HFP changes state. Do not
+        // treat that re-enumeration as a physical unplug while the replacement
+        // endpoint is still being published by AudioPolicy.
+        private const val EXTERNAL_DEVICE_REPLACEMENT_GRACE_MS = 1_600L
     }
     
     // Delegate for handling device disconnection
@@ -76,17 +90,38 @@ class AudioDeviceManager(
     
     // Audio manager for accessing device information
     private val audioManager: AudioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    // OEM AudioDeviceInfo.productName may be the tablet model for SCO inputs.
+    // Connection broadcasts and the headset profile provide the real label.
+    private val bluetoothNamesByAddress = mutableMapOf<String, String>()
+    private var lastBluetoothDeviceName: String? = null
+    private var bluetoothHeadsetProfile: BluetoothProfile? = null
+    private val connectedHeadsets = java.util.concurrent.ConcurrentHashMap<String, BluetoothDevice>()
+    private val disconnectedHeadsetAddresses = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     
     // Last selected device ID for tracking changes
     private var lastSelectedDeviceId: String? = null
+
+    // Preserve USB labels after the AudioDeviceInfo is removed on detach.
+    private val usbNamesByKey = mutableMapOf<String, String>()
+    private val usbAudioDeviceNamesById = mutableMapOf<String, String>()
+    private val usbAudioDeviceKeysById = mutableMapOf<String, String>()
+    private val usbAudioDeviceIds = mutableSetOf<String>()
+    private val pendingAttachedUsbDeviceKeys = mutableSetOf<String>()
+    private val pendingExternalRemovals = mutableMapOf<String, Pair<String, Runnable>>()
+    private val deviceCapabilitiesCache = mutableMapOf<String, Map<String, Any>>()
     
     // BroadcastReceiver for device connection/disconnection
     private var deviceReceiver: BroadcastReceiver? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingUsbDeviceScan: Runnable? = null
     
     // Coroutine scope for async operations
     private val coroutineScope = CoroutineScope(Dispatchers.Main)
     
     init {
+        preloadConnectedBluetoothHeadsetNames()
         // Start monitoring device changes only if BT_CONNECT permission is available (#294)
         if (enableDeviceDetection) {
             startMonitoringDeviceChanges()
@@ -110,8 +145,10 @@ class AudioDeviceManager(
         // Get all audio devices
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val audioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            val headsets = connectedBluetoothInputs()
             
             for (device in audioDevices) {
+                if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO && headsets.isNotEmpty()) continue
                 if (device.type == AudioDeviceInfo.TYPE_UNKNOWN) {
                     continue
                 }
@@ -140,6 +177,17 @@ class AudioDeviceManager(
                     deviceMap[key] = mutableListOf()
                 }
                 deviceMap[key]?.add(deviceInfo)
+            }
+            headsets.forEach { (address, headset) ->
+                val id = AudioInputRoutes.BLUETOOTH_PREFIX + address
+                devices.add(mapOf(
+                    "id" to id,
+                    "name" to (headset.name?.takeIf { it.isNotBlank() } ?: "Bluetooth Headset"),
+                    "type" to DEVICE_TYPE_BLUETOOTH,
+                    "isDefault" to (lastSelectedDeviceId == id),
+                    "capabilities" to getDefaultCapabilities(),
+                    "isAvailable" to true
+                ))
             }
             
             // Deduplicate while preserving devices with different capabilities
@@ -323,6 +371,15 @@ class AudioDeviceManager(
      * Gets the currently active input device (internal implementation)
      */
     private fun getCurrentInputDeviceInternal(): Map<String, Any>? {
+        val selectedId = lastSelectedDeviceId
+        if (selectedId?.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX) == true) {
+            val headset = connectedBluetoothInputs()[selectedId.removePrefix(AudioInputRoutes.BLUETOOTH_PREFIX)]
+            if (headset != null) return mapOf(
+                "id" to selectedId, "name" to (headset.name ?: "Bluetooth Headset"),
+                "type" to DEVICE_TYPE_BLUETOOTH, "isDefault" to false,
+                "capabilities" to getDefaultCapabilities(), "isAvailable" to true
+            )
+        }
         // On Android, we need to check the current routing
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val audioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
@@ -330,9 +387,11 @@ class AudioDeviceManager(
             // Determine current input device based on the communication device
             // or audio routing
             // For API level 31+, we can use getCommunicationDevice() directly
-            var currentDevice: AudioDeviceInfo? = null
+            var currentDevice: AudioDeviceInfo? = audioDevices.firstOrNull {
+                it.id.toString() == lastSelectedDeviceId
+            }
             
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (currentDevice == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 currentDevice = audioManager.communicationDevice?.takeIf { 
                     it.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER && 
                     it.isSource 
@@ -430,7 +489,43 @@ class AudioDeviceManager(
     /**
      * Selects a specific audio input device asynchronously (for internal use)
      */
-    suspend fun selectDevice(deviceId: String): Boolean = selectDeviceNow(deviceId)
+    suspend fun selectDevice(deviceId: String): Boolean {
+        if (!selectDeviceNow(deviceId)) return false
+        if (!deviceId.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX)) return true
+        // SCO activation is asynchronous. Never start AudioRecord on the tablet while
+        // the selected headset's communication channel is still being established.
+        // Lenovo Android 11 commonly needs 4-7 seconds when A2DP is active and
+        // has to hand the headset over to HFP/SCO. The previous 3 second window
+        // timed out, reset the route, and made the UI fall back to the tablet mic.
+        repeat(120) {
+            if (!isDeviceAvailable(deviceId)) {
+                LogUtils.w(TAG, "Bluetooth input disappeared while SCO was connecting: $deviceId")
+                return false
+            }
+            val input = AudioInputRoutes.resolve(audioManager, deviceId)
+            val routed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            } else {
+                val stickyState = context.registerReceiver(
+                    null,
+                    IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED),
+                )?.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
+                audioManager.isBluetoothScoOn ||
+                    stickyState == AudioManager.SCO_AUDIO_STATE_CONNECTED
+            }
+            if (input != null && routed) {
+                LogUtils.d(TAG, "Bluetooth input ready after SCO connection: $deviceId")
+                return true
+            }
+            delay(50)
+        }
+        LogUtils.w(
+            TAG,
+            "Bluetooth SCO timed out without a usable input endpoint: $deviceId " +
+                "scoOn=${audioManager.isBluetoothScoOn}",
+        )
+        return false
+    }
 
     internal fun selectDeviceNow(deviceId: String): Boolean {
         LogUtils.d(TAG, "Asynchronously selecting device with ID: $deviceId")
@@ -440,8 +535,23 @@ class AudioDeviceManager(
         }
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val audioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            val selectedDevice = audioDevices.firstOrNull { it.id.toString() == deviceId }
+            if (deviceId.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX)) {
+                if (!isDeviceAvailable(deviceId)) return false
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val address = deviceId.removePrefix(AudioInputRoutes.BLUETOOTH_PREFIX)
+                    val sinks = audioManager.availableCommunicationDevices.filter {
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    }
+                    val sink = sinks.firstOrNull { it.address.equals(address, ignoreCase = true) }
+                        ?: sinks.singleOrNull() ?: return false
+                    return reportSelection(audioManager.setCommunicationDevice(sink))
+                }
+                audioManager.startBluetoothSco()
+                audioManager.isBluetoothScoOn = true
+                return reportSelection()
+            }
+            val selectedDevice = AudioInputRoutes.resolve(audioManager, deviceId)
             
             if (selectedDevice == null) {
                 LogUtils.e(TAG, "Device not found with ID $deviceId for async selection")
@@ -449,22 +559,54 @@ class AudioDeviceManager(
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                // Android accepts only sink devices from this list. It selects the paired
-                // input source automatically after the sink request succeeds.
+                // Android accepts only sink devices from this list. Keep playback on the
+                // paired route when it is already available, but do not make capture
+                // selection depend on that output endpoint. Right after a wired/USB input
+                // is reported, availableCommunicationDevices may still omit its sink or
+                // setCommunicationDevice() may transiently reject it. The new AudioRecord
+                // validates the requested source with setPreferredDevice().
                 val communicationDevices = audioManager.availableCommunicationDevices
                 val sinkId = selectCommunicationSink(
                     requested = selectedDevice.toCommunicationDeviceDescriptor(),
                     availableSinks = communicationDevices.map {
                         it.toCommunicationDeviceDescriptor()
                     }
-                ) ?: return false
-                val sink = communicationDevices.firstOrNull { it.id == sinkId } ?: return false
-                val success = attemptCommunicationDeviceSelection(
-                    selection = { audioManager.setCommunicationDevice(sink) },
-                    onAccepted = { lastSelectedDeviceId = deviceId }
                 )
-                LogUtils.d(TAG, "Setting communication sink ${sink.id} for input $deviceId: $success")
-                return success
+                val sink = sinkId?.let { id ->
+                    communicationDevices.firstOrNull { it.id == id }
+                }
+                val previousSelectedDeviceId = lastSelectedDeviceId
+                val outputRouted = sink?.let {
+                    attemptCommunicationDeviceSelection(
+                        selection = { audioManager.setCommunicationDevice(it) }
+                    )
+                } ?: false
+                if (!outputRouted && previousSelectedDeviceId?.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX) == true) {
+                    // Do not leave a previous Bluetooth SCO route active while the
+                    // newly inserted wired/USB input is being selected. Capture can
+                    // still use the preferred input below, and playback can retry
+                    // its paired output once Android publishes the endpoint.
+                    try {
+                        audioManager.clearCommunicationDevice()
+                    } catch (_: Exception) {
+                        // Some OEMs reject clearing during a route transition; the
+                        // AudioRecord preferred-device check remains authoritative.
+                    }
+                }
+                lastSelectedDeviceId = deviceId
+                if (sink == null) {
+                    LogUtils.w(
+                        TAG,
+                        "Communication sink is not ready for input $deviceId; " +
+                            "capture will validate the preferred input"
+                    )
+                } else {
+                    LogUtils.d(
+                        TAG,
+                        "Setting communication sink ${sink.id} for input $deviceId: $outputRouted"
+                    )
+                }
+                return true
             }
             
             // Handle device selection based on type
@@ -485,6 +627,15 @@ class AudioDeviceManager(
                         audioManager.stopBluetoothSco()
                         audioManager.isBluetoothScoOn = false
                     }
+
+                    // Android 10 has no setCommunicationDevice(). Explicitly
+                    // clear the speakerphone force-use when an external wired
+                    // input is selected; otherwise Lenovo keeps communication
+                    // audio on the tablet speaker even though AudioRecord's
+                    // preferred input is the headset.
+                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                    audioManager.isSpeakerphoneOn =
+                        selectedDevice.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
                     
                     return reportSelection()
                 }
@@ -566,30 +717,8 @@ class AudioDeviceManager(
      * Force refreshes the audio session to update device list
      */
     fun forceRefreshAudioDevices(): Boolean {
-        LogUtils.d(TAG, "Forcing refresh of audio devices")
-        
-        // Not much to do on Android since devices are enumerated on-demand
-        // but we can check if SCO is consistent with device state
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val audioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-                val hasBluetoothSco = audioDevices.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-                
-                // If we have a Bluetooth SCO device but SCO isn't started, start it
-                if (hasBluetoothSco && !audioManager.isBluetoothScoOn && lastSelectedDeviceId != null) {
-                    val device = audioDevices.firstOrNull { it.id.toString() == lastSelectedDeviceId }
-                    if (device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-                        audioManager.startBluetoothSco()
-                        audioManager.isBluetoothScoOn = true
-                    }
-                }
-            }
-            
-            return true
-        } catch (e: Exception) {
-            LogUtils.e(TAG, "Error refreshing audio devices: ${e.message}")
-            return false
-        }
+        // Enumeration must never change the selected route or open an SCO channel.
+        return true
     }
     
     /**
@@ -615,13 +744,22 @@ class AudioDeviceManager(
      */
     @RequiresApi(Build.VERSION_CODES.M)
     private fun getDeviceName(device: AudioDeviceInfo): String {
+        val usbName = getUsbDeviceName(device)
+        val bluetoothName = getBluetoothDeviceName(device)
         // Get product name if available
         val productName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             device.productName?.toString()
         } else null
         
         // Get base name
-        val baseName = if (productName.isNullOrBlank()) {
+        val baseName = if (!usbName.isNullOrBlank()) {
+            usbName
+        } else if (!bluetoothName.isNullOrBlank()) {
+            bluetoothName
+        } else if (device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET &&
+            (productName.isNullOrBlank() || productName.equals("h2w", ignoreCase = true))) {
+            "Wired Headset"
+        } else if (productName.isNullOrBlank()) {
             when (device.type) {
                 AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Built-in Microphone"
                 AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth Headset"
@@ -636,6 +774,8 @@ class AudioDeviceManager(
         } else {
             productName
         }
+
+        if (isUsbAudioDevice(device)) return baseName
         
         // Get capability details for naming
         val maxSampleRate = device.sampleRates?.maxOrNull() ?: 0
@@ -695,11 +835,17 @@ class AudioDeviceManager(
      */
     @RequiresApi(Build.VERSION_CODES.M)
     private fun getBaseDeviceName(device: AudioDeviceInfo): String {
+        val usbName = getUsbDeviceName(device)
+        val bluetoothName = getBluetoothDeviceName(device)
         val productName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             device.productName?.toString()
         } else null
         
-        return if (productName.isNullOrBlank()) {
+        return if (!usbName.isNullOrBlank()) {
+            usbName
+        } else if (!bluetoothName.isNullOrBlank()) {
+            bluetoothName
+        } else if (productName.isNullOrBlank()) {
             when (device.type) {
                 AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Built-in Microphone"
                 AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth Headset"
@@ -713,6 +859,213 @@ class AudioDeviceManager(
             }
         } else {
             productName
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun getUsbDeviceName(device: AudioDeviceInfo): String? {
+        if (!isUsbAudioDevice(device)) return null
+        usbAudioDeviceNamesById[device.id.toString()]?.let { return it }
+        val usbManager = context.getSystemService(Context.USB_SERVICE) as? UsbManager
+            ?: return null
+        return try {
+            val candidates = usbManager.deviceList.values.filter { usbDevice ->
+                usbDevice.deviceClass == android.hardware.usb.UsbConstants.USB_CLASS_AUDIO ||
+                    (0 until usbDevice.interfaceCount).any { index ->
+                        usbDevice.getInterface(index).interfaceClass ==
+                            android.hardware.usb.UsbConstants.USB_CLASS_AUDIO
+                    }
+            }
+            val reportedName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                device.productName?.toString()?.normalizeDeviceName()
+            } else null
+            val matchingCandidates = if (reportedName.isNullOrBlank()) {
+                emptyList()
+            } else {
+                candidates.filter { usbDevice ->
+                    val productName = usbDevice.productName?.normalizeDeviceName()
+                    val manufacturerName = usbDevice.manufacturerName?.normalizeDeviceName()
+                    reportedName == productName || reportedName == manufacturerName
+                }
+            }
+            val usbDevice = matchingCandidates.singleOrNull()
+                ?: candidates.singleOrNull()
+                ?: return null
+            val name = usbDeviceDisplayName(usbDevice)
+            usbNamesByKey[usbDeviceKey(usbDevice)] = name
+            name
+        } catch (_: SecurityException) {
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun usbDeviceKey(device: UsbDevice): String =
+        "${device.vendorId}:${device.productId}:${device.deviceName}"
+
+    private fun usbDeviceDisplayName(device: UsbDevice): String {
+        val product = device.productName?.trim().orEmpty()
+        val manufacturer = device.manufacturerName?.trim().orEmpty()
+        return product.takeIf { it.isNotBlank() }
+            ?: manufacturer.takeIf { it.isNotBlank() }
+            ?: usbNamesByKey[usbDeviceKey(device)]
+            ?: "USB Audio Device (${device.vendorId.toString(16).padStart(4, '0')}:${device.productId.toString(16).padStart(4, '0')})"
+    }
+
+    private fun String.normalizeDeviceName(): String =
+        trim().lowercase().replace(Regex("\\s+"), " ")
+
+    private fun getUsbDeviceFromIntent(intent: Intent): UsbDevice? {
+        if (!intent.hasExtra(UsbManager.EXTRA_DEVICE)) return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+        }
+    }
+
+    private fun isUsbAudioDevice(device: AudioDeviceInfo): Boolean =
+        device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            device.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+
+    /**
+     * Some OEMs expose an anonymous SCO endpoint whose productName is the
+     * tablet model. Resolve the connected headset profile as well, including
+     * headsets that were connected before the app started.
+     */
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun getBluetoothDeviceName(device: AudioDeviceInfo): String? {
+        if (device.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED) {
+            return null
+        }
+        val address = device.address.orEmpty()
+        bluetoothNamesByAddress[address]?.let { return it }
+        return try {
+            val connectedHeadsets = bluetoothHeadsetProfile?.connectedDevices.orEmpty()
+            connectedHeadsets.firstOrNull {
+                address.isNotBlank() &&
+                    it.address.equals(address, ignoreCase = true)
+            }?.let { headset ->
+                rememberBluetoothDevice(headset)
+                return headset.name?.takeIf { it.isNotBlank() }
+            }
+            if (connectedHeadsets.size == 1) {
+                rememberBluetoothDevice(connectedHeadsets.first())
+                connectedHeadsets.first().name?.takeIf { it.isNotBlank() }?.let {
+                    return it
+                }
+            }
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+            val bondedDevices = adapter?.bondedDevices.orEmpty()
+            val bondedName = bondedDevices
+                .firstOrNull { it.address.equals(address, ignoreCase = true) }
+                ?.name
+                ?.takeIf { it.isNotBlank() }
+            if (bondedName != null) return bondedName
+
+            // Lenovo Android 11 exposes SCO with a zero address and an empty
+            // HEADSET profile list. When exactly one bonded headset is active,
+            // its name is the only unambiguous user-visible label available.
+            if (address == "00:00:00:00:00:00" &&
+                adapter?.getProfileConnectionState(BluetoothProfile.HEADSET) ==
+                    BluetoothProfile.STATE_CONNECTED &&
+                bondedDevices.size == 1) {
+                bondedDevices.first().name?.takeIf { it.isNotBlank() }?.let {
+                    return it
+                }
+            }
+            lastBluetoothDeviceName
+        } catch (_: SecurityException) {
+            lastBluetoothDeviceName
+        } catch (_: IllegalArgumentException) {
+            lastBluetoothDeviceName
+        }
+    }
+
+    private fun rememberBluetoothDevice(device: BluetoothDevice) {
+        try {
+            val name = device.name?.takeIf { it.isNotBlank() } ?: return
+            lastBluetoothDeviceName = name
+            val address = device.address.orEmpty()
+            if (address.isNotBlank()) bluetoothNamesByAddress[address] = name
+        } catch (_: SecurityException) {
+            // BLUETOOTH_CONNECT can be revoked while a broadcast is in flight.
+        }
+    }
+
+    private fun connectedBluetoothInputs(): Map<String, BluetoothDevice> {
+        return try {
+            val adapter = BluetoothAdapter.getDefaultAdapter() ?: return emptyMap()
+            if (adapter.getProfileConnectionState(BluetoothProfile.HEADSET) != BluetoothProfile.STATE_CONNECTED) {
+                connectedHeadsets.clear()
+                return emptyMap()
+            }
+            bluetoothHeadsetProfile?.connectedDevices.orEmpty().forEach { device ->
+                if (device.address !in disconnectedHeadsetAddresses) {
+                    rememberBluetoothDevice(device)
+                    connectedHeadsets[device.address] = device
+                }
+            }
+            // Some Lenovo firmware returns an empty profile list even though HFP
+            // is connected. Only infer identity when exactly one bonded device exists.
+            if (connectedHeadsets.isEmpty()) {
+                adapter.bondedDevices.singleOrNull()?.let { device ->
+                    if (device.address !in disconnectedHeadsetAddresses) {
+                        connectedHeadsets[device.address] = device
+                    }
+                }
+            }
+            connectedHeadsets.toMap()
+        } catch (_: SecurityException) {
+            emptyMap()
+        }
+    }
+
+    /**
+     * AudioDeviceInfo can expose an anonymous SCO endpoint (00:00:00:00:00:00)
+     * whose productName is the tablet model. Query the connected HEADSET
+     * profile so its real user-visible name is available on initial refresh.
+     */
+    private fun preloadConnectedBluetoothHeadsetNames() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
+        try {
+            adapter.getProfileProxy(context, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                    if (profile != BluetoothProfile.HEADSET) return
+                    bluetoothHeadsetProfile = proxy
+                    try {
+                        proxy.connectedDevices.forEach { device ->
+                            rememberBluetoothDevice(device)
+                            disconnectedHeadsetAddresses.remove(device.address)
+                            connectedHeadsets[device.address] = device
+                        }
+                        scheduleUsbDeviceScan()
+                    } catch (_: SecurityException) {
+                        // Permission can be revoked while the profile binds.
+                    }
+                }
+
+                override fun onServiceDisconnected(profile: Int) {
+                    if (profile == BluetoothProfile.HEADSET) {
+                        bluetoothHeadsetProfile = null
+                    }
+                }
+            }, BluetoothProfile.HEADSET)
+        } catch (_: SecurityException) {
+            // Bluetooth names are optional; keep the platform fallback label.
+        } catch (_: IllegalArgumentException) {
+            // The OEM Bluetooth service may not expose the headset profile.
         }
     }
     
@@ -762,14 +1115,19 @@ class AudioDeviceManager(
             
             combinedCounts.toList().sorted()
         }
+
+        val cacheKey = "${device.id}:${sampleRates.joinToString(",")}:${channelCounts.joinToString(",")}"
+        deviceCapabilitiesCache[cacheKey]?.let { return it }
         
         // Test if common configurations are actually supported
-        val verifiedSampleRates = verifyAudioConfigurations(device.id, channelCounts.firstOrNull() ?: 1, sampleRates)
+        // Probing with temporary AudioRecords can interrupt the live recorder.
+        // Enumerate metadata only; the actual recorder validates its configuration.
+        val verifiedSampleRates = sampleRates
         
         // Android doesn't provide bit depth info, so we use common values
         val bitDepths = listOf(16, 24)
         
-        return mapOf(
+        val capabilities = mapOf(
             "sampleRates" to verifiedSampleRates,
             "channelCounts" to channelCounts,
             "bitDepths" to bitDepths,
@@ -777,6 +1135,9 @@ class AudioDeviceManager(
             "hasNoiseSuppression" to true, // Android generally has noise suppression
             "hasAutomaticGainControl" to true // Android generally has AGC
         )
+        if (deviceCapabilitiesCache.size >= 64) deviceCapabilitiesCache.clear()
+        deviceCapabilitiesCache[cacheKey] = capabilities
+        return capabilities
     }
     
     /**
@@ -944,6 +1305,9 @@ class AudioDeviceManager(
      * Checks if a device is still available
      */
     fun isDeviceAvailable(deviceId: String): Boolean {
+        if (deviceId.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX)) {
+            return connectedBluetoothInputs().containsKey(deviceId.removePrefix(AudioInputRoutes.BLUETOOTH_PREFIX))
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val audioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
             return audioDevices.any { it.id.toString() == deviceId }
@@ -980,6 +1344,7 @@ class AudioDeviceManager(
                 
                 // Bluetooth connection state changes
                 addAction(ACTION_CONNECTION_STATE_CHANGED)
+                addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
                 
                 // USB device events - to detect USB audio devices
                 addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
@@ -999,6 +1364,61 @@ class AudioDeviceManager(
                 override fun onReceive(context: Context, intent: Intent) {
                     val action = intent.action
                     LogUtils.d(CLASS_NAME, "Device connectivity changed: $action")
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                        (action == BluetoothDevice.ACTION_ACL_CONNECTED ||
+                        action == BluetoothDevice.ACTION_ACL_DISCONNECTED ||
+                        action == ACTION_CONNECTION_STATE_CHANGED ||
+                        action == BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED ||
+                        action == AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED ||
+                        action == AudioManager.ACTION_AUDIO_BECOMING_NOISY)) {
+                        if (action == BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) {
+                            @Suppress("DEPRECATION")
+                            val headset = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                            if (headset != null) {
+                                val id = AudioInputRoutes.BLUETOOTH_PREFIX + headset.address
+                                when (intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)) {
+                                    BluetoothProfile.STATE_CONNECTED -> {
+                                        rememberBluetoothDevice(headset)
+                                        disconnectedHeadsetAddresses.remove(headset.address)
+                                        connectedHeadsets[headset.address] = headset
+                                        handleDeviceConnection(id)
+                                    }
+                                    BluetoothProfile.STATE_DISCONNECTED -> {
+                                        disconnectedHeadsetAddresses.add(headset.address)
+                                        connectedHeadsets.remove(headset.address)
+                                        handleDeviceDisconnectionEvent(id)
+                                        if (id == lastSelectedDeviceId) coroutineScope.launch {
+                                            handleDeviceDisconnection(id)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // SCO/noisy events describe routes, not physical detachments.
+                        // An ACL connection may be A2DP-only; HEADSET determines inputs.
+                        scheduleUsbDeviceScan()
+                        return
+                    }
+
+                    if (action == UsbManager.ACTION_USB_DEVICE_ATTACHED ||
+                        action == UsbManager.ACTION_USB_DEVICE_DETACHED ||
+                        action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED ||
+                        action == UsbManager.ACTION_USB_ACCESSORY_DETACHED) {
+                        getUsbDeviceFromIntent(intent)?.let { usbDevice ->
+                            val attached = action == UsbManager.ACTION_USB_DEVICE_ATTACHED ||
+                                action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED
+                            val key = usbDeviceKey(usbDevice)
+                            usbNamesByKey[key] = usbDeviceDisplayName(usbDevice)
+                            if (attached) {
+                                pendingAttachedUsbDeviceKeys.add(key)
+                            } else {
+                                pendingAttachedUsbDeviceKeys.remove(key)
+                            }
+                        }
+                        scheduleUsbDeviceScan()
+                        return
+                    }
                     
                     // Log current audio state for debugging
                     logAudioState()
@@ -1010,6 +1430,12 @@ class AudioDeviceManager(
                     
                     when (action) {
                         AudioManager.ACTION_HEADSET_PLUG -> {
+                            // Broadcast names and AudioDeviceInfo labels differ on OEMs
+                            // (e.g. "Wired Headset" vs "h2w"). Diff real input IDs instead.
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                scheduleUsbDeviceScan()
+                                return
+                            }
                             val state = intent.getIntExtra("state", 0)
                             val microphone = intent.getIntExtra("microphone", 0)
                             val name = intent.getStringExtra("name") ?: "Wired Headset"
@@ -1060,6 +1486,20 @@ class AudioDeviceManager(
                         
                         AudioManager.ACTION_AUDIO_BECOMING_NOISY -> {
                             LogUtils.d(CLASS_NAME, "Audio becoming noisy - potential device disconnect")
+
+                            // USB has a dedicated route callback that preserves
+                            // the removed AudioDeviceInfo and its cached label.
+                            // Avoid emitting a second disconnect from this
+                            // generic broadcast before that callback is handled.
+                            if (lastSelectedDeviceId != null &&
+                                lastSelectedDeviceId in usbAudioDeviceIds) {
+                                LogUtils.d(
+                                    CLASS_NAME,
+                                    "Selected USB input disconnect will be handled by AudioDeviceCallback: $lastSelectedDeviceId"
+                                )
+                                forceRefreshAudioDevices()
+                                return
+                            }
                             
                             // This could be any type of device disconnect, so we need to check
                             // what device was actually removed by comparing current devices with our last device
@@ -1095,6 +1535,7 @@ class AudioDeviceManager(
                             }
                             
                             if (device != null) {
+                                rememberBluetoothDevice(device)
                                 LogUtils.d(CLASS_NAME, "Bluetooth device connected: ${device.name}")
                                 
                                 // For M+ find the actual new device
@@ -1148,6 +1589,7 @@ class AudioDeviceManager(
                             }
                             
                             if (device != null) {
+                                rememberBluetoothDevice(device)
                                 deviceId = "2" // Legacy ID for bluetooth headset
                                 deviceName = device.name
                                 deviceType = DEVICE_TYPE_BLUETOOTH
@@ -1178,6 +1620,7 @@ class AudioDeviceManager(
                                     }
                                     
                                     if (device != null) {
+                                        rememberBluetoothDevice(device)
                                         LogUtils.d(CLASS_NAME, "Bluetooth profile connected: ${device.name}")
                                         
                                         // For M+ find the actual new device
@@ -1231,6 +1674,7 @@ class AudioDeviceManager(
                                     }
                                     
                                     if (device != null) {
+                                        rememberBluetoothDevice(device)
                                         deviceId = "2" // Legacy ID for bluetooth
                                         deviceName = device.name
                                         deviceType = DEVICE_TYPE_BLUETOOTH
@@ -1254,45 +1698,6 @@ class AudioDeviceManager(
                                             LogUtils.d(CLASS_NAME, "Bluetooth profile disconnected, using last selected device ID: $deviceId")
                                         }
                                     }
-                                }
-                            }
-                        }
-                        
-                        UsbManager.ACTION_USB_DEVICE_ATTACHED, UsbManager.ACTION_USB_ACCESSORY_ATTACHED -> {
-                            LogUtils.d(CLASS_NAME, "USB device attached")
-                            
-                            // For M+ find newly connected USB audio devices
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                val audioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-                                val usbDevice = audioDevices.firstOrNull { 
-                                    it.type == AudioDeviceInfo.TYPE_USB_DEVICE || 
-                                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET || 
-                                    it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
-                                }
-                                
-                                if (usbDevice != null) {
-                                    val connectedDeviceId = usbDevice.id.toString()
-                                    val deviceName = getDeviceName(usbDevice)
-                                    LogUtils.d(CLASS_NAME, "Found connected USB audio device: $deviceName (ID: $connectedDeviceId)")
-                                    handleDeviceConnection(connectedDeviceId)
-                                }
-                            }
-                        }
-                        
-                        UsbManager.ACTION_USB_DEVICE_DETACHED, UsbManager.ACTION_USB_ACCESSORY_DETACHED -> {
-                            LogUtils.d(CLASS_NAME, "USB device detached")
-                            
-                            // Check if our last selected device was USB
-                            if (lastSelectedDeviceId != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                val lastDeviceInfo = findDeviceById(lastSelectedDeviceId!!)
-                                
-                                if (lastDeviceInfo?.type == AudioDeviceInfo.TYPE_USB_DEVICE || 
-                                   lastDeviceInfo?.type == AudioDeviceInfo.TYPE_USB_HEADSET || 
-                                   lastDeviceInfo?.type == AudioDeviceInfo.TYPE_USB_ACCESSORY) {
-                                    deviceId = lastSelectedDeviceId
-                                    deviceType = DEVICE_TYPE_USB
-                                    deviceName = getDeviceName(lastDeviceInfo)
-                                    LogUtils.d(CLASS_NAME, "USB audio device disconnected: $deviceName")
                                 }
                             }
                         }
@@ -1372,12 +1777,165 @@ class AudioDeviceManager(
             }
             
             context.registerReceiver(deviceReceiver, filter)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                registerUsbAudioDeviceCallback()
+            }
             LogUtils.d(CLASS_NAME, "Started monitoring device changes")
         } catch (e: Exception) {
             LogUtils.e(CLASS_NAME, "Error starting device monitoring: ${e.message}", e)
         }
     }
-    
+
+    /**
+     * Use AudioManager's route callback as the source of truth. USB broadcasts
+     * can precede audio-policy registration and are only used to cache metadata.
+     */
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun isMonitoredExternalInput(device: AudioDeviceInfo): Boolean =
+        device.isSource && (isUsbAudioDevice(device) ||
+            device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET)
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun monitoredExternalDeviceKey(device: AudioDeviceInfo): String =
+        "${mapDeviceType(device)}:${getDeviceName(device).trim().lowercase()}"
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun registerUsbAudioDeviceCallback() {
+        val existingDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .filter(::isMonitoredExternalInput)
+        usbAudioDeviceIds.clear()
+        existingDevices.forEach { device ->
+            val id = device.id.toString()
+            usbAudioDeviceIds.add(id)
+            usbAudioDeviceNamesById[id] = getDeviceName(device)
+            usbAudioDeviceKeysById[id] = monitoredExternalDeviceKey(device)
+        }
+
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                scheduleUsbDeviceScan()
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                scheduleUsbDeviceScan()
+            }
+        }
+        audioDeviceCallback = callback
+        audioManager.registerAudioDeviceCallback(callback, mainHandler)
+    }
+
+    private fun scheduleUsbDeviceScan() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        pendingUsbDeviceScan?.let(mainHandler::removeCallbacks)
+        val scan = Runnable {
+            val currentDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                .filter(::isMonitoredExternalInput)
+            val currentById = currentDevices.associateBy { it.id.toString() }
+            val currentIds = currentById.keys
+            val addedIds = currentIds - usbAudioDeviceIds
+            val removedIds = usbAudioDeviceIds - currentIds
+            val sameScanReplacementKeys = removedIds.mapNotNull { removedId ->
+                usbAudioDeviceKeysById[removedId]
+            }.toSet()
+            val broadcastName = if (addedIds.size == 1) {
+                pendingAttachedUsbDeviceKeys.singleOrNull()?.let(usbNamesByKey::get)
+            } else null
+
+            addedIds.forEach { id ->
+                val device = currentById[id] ?: return@forEach
+                val deviceKey = monitoredExternalDeviceKey(device)
+                val replacement = pendingExternalRemovals.entries.firstOrNull { it.value.first == deviceKey }
+                if (replacement != null) {
+                    mainHandler.removeCallbacks(replacement.value.second)
+                    pendingExternalRemovals.remove(replacement.key)
+                    usbAudioDeviceNamesById.remove(replacement.key)
+                    usbAudioDeviceKeysById.remove(replacement.key)
+                    deviceCapabilitiesCache.keys.removeAll { it.startsWith("${replacement.key}:") }
+                    LogUtils.d(
+                        CLASS_NAME,
+                        "External input re-enumerated without disconnect: " +
+                            "${replacement.key} -> $id (${getDeviceName(device)})"
+                    )
+                }
+                // UsbManager knows the consumer-facing product name before the
+                // audio-policy route appears. It is safe to associate it only
+                // when both sides report exactly one new device.
+                val name = broadcastName?.takeIf { isUsbAudioDevice(device) } ?: getDeviceName(device)
+                usbAudioDeviceNamesById[id] = name
+                usbAudioDeviceKeysById[id] = deviceKey
+                LogUtils.d(CLASS_NAME, "External input available: $name (ID: $id, type: ${device.type})")
+                if (replacement == null && deviceKey !in sameScanReplacementKeys) {
+                    handleDeviceConnection(id)
+                }
+            }
+            removedIds.forEach { id ->
+                val name = usbAudioDeviceNamesById[id] ?: "unknown"
+                val deviceKey = usbAudioDeviceKeysById[id]
+                if (deviceKey != null && deviceKey in sameScanReplacementKeys) {
+                    usbAudioDeviceNamesById.remove(id)
+                    usbAudioDeviceKeysById.remove(id)
+                    deviceCapabilitiesCache.keys.removeAll { it.startsWith("$id:") }
+                    LogUtils.d(CLASS_NAME, "External input re-enumerated in same scan: $id ($name)")
+                    return@forEach
+                }
+                val removal = Runnable {
+                    pendingExternalRemovals.remove(id)
+                    usbAudioDeviceNamesById.remove(id)
+                    usbAudioDeviceKeysById.remove(id)
+                    deviceCapabilitiesCache.keys.removeAll { it.startsWith("$id:") }
+                    // A replacement with the same logical device key may have
+                    // appeared after this scan but before the grace timer.
+                    if (deviceKey != null && currentMonitoredExternalDeviceKey(deviceKey)) {
+                        LogUtils.d(CLASS_NAME, "External input removal canceled after delayed replacement: $id")
+                        return@Runnable
+                    }
+                    LogUtils.d(CLASS_NAME, "External input removed: $name (ID: $id)")
+                    handleDeviceDisconnectionEvent(id)
+                    if (id == lastSelectedDeviceId) {
+                        coroutineScope.launch {
+                            try {
+                                handleDeviceDisconnection(id)
+                            } catch (e: Exception) {
+                                LogUtils.e(CLASS_NAME, "Error handling USB disconnection: ${e.message}", e)
+                            }
+                        }
+                    }
+                    if (pendingExternalRemovals.isEmpty()) {
+                        onDeviceConnected?.invoke("inventory")
+                    }
+                }
+                if (deviceKey != null) {
+                    pendingExternalRemovals[id]?.second?.let(mainHandler::removeCallbacks)
+                    pendingExternalRemovals[id] = deviceKey to removal
+                    LogUtils.d(
+                        CLASS_NAME,
+                        "Delaying external input removal for $EXTERNAL_DEVICE_REPLACEMENT_GRACE_MS ms: " +
+                            "$name (ID: $id, key: $deviceKey)"
+                    )
+                    mainHandler.postDelayed(removal, EXTERNAL_DEVICE_REPLACEMENT_GRACE_MS)
+                } else {
+                    removal.run()
+                }
+            }
+            usbAudioDeviceIds.clear()
+            usbAudioDeviceIds.addAll(currentIds)
+            if (addedIds.isNotEmpty()) pendingAttachedUsbDeviceKeys.clear()
+            forceRefreshAudioDevices()
+            // Also refresh when only the Bluetooth endpoint changed. Its physical
+            // HEADSET entry remains in the inventory while SCO is inactive.
+            // A removal is held during the replacement grace period. Avoid
+            // publishing an intermediate inventory without the selected input;
+            // that would make JS clear the user's route before the replacement
+            // AudioDeviceInfo id arrives.
+            if (pendingExternalRemovals.isEmpty()) {
+                onDeviceConnected?.invoke("inventory")
+            }
+            pendingUsbDeviceScan = null
+        }
+        pendingUsbDeviceScan = scan
+        mainHandler.postDelayed(scan, USB_DEVICE_CHANGE_DEBOUNCE_MS)
+    }
+
     /**
      * Helper method to find a device by ID
      */
@@ -1429,6 +1987,28 @@ class AudioDeviceManager(
     fun cleanup() {
         // Stop monitoring device changes
         stopMonitoringDeviceChanges()
+        pendingUsbDeviceScan?.let(mainHandler::removeCallbacks)
+        pendingUsbDeviceScan = null
+        pendingExternalRemovals.values.forEach { mainHandler.removeCallbacks(it.second) }
+        pendingExternalRemovals.clear()
+        audioDeviceCallback?.let { callback ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.unregisterAudioDeviceCallback(callback)
+            }
+        }
+        audioDeviceCallback = null
+
+        bluetoothHeadsetProfile?.let { profile ->
+            try {
+                BluetoothAdapter.getDefaultAdapter()?.closeProfileProxy(
+                    BluetoothProfile.HEADSET,
+                    profile
+                )
+            } catch (_: SecurityException) {
+                // Permission can be revoked before teardown.
+            }
+        }
+        bluetoothHeadsetProfile = null
         
         // Stop Bluetooth SCO if active
         if (audioManager.isBluetoothScoOn) {
@@ -1436,6 +2016,12 @@ class AudioDeviceManager(
             audioManager.isBluetoothScoOn = false
         }
     }
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun currentMonitoredExternalDeviceKey(key: String): Boolean =
+        audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .filter(::isMonitoredExternalInput)
+            .any { monitoredExternalDeviceKey(it) == key }
     
     /**
      * Stops monitoring device connection/disconnection events
@@ -1617,15 +2203,19 @@ internal fun preferredCommunicationSinkTypes(inputType: Int): List<Int> = when (
     AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> listOf(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
     AudioDeviceInfo.TYPE_WIRED_HEADSET -> listOf(
         AudioDeviceInfo.TYPE_WIRED_HEADSET,
-        AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        // Lenovo exposes the wired playback endpoint as AUDIO_DEVICE_OUT_LINE.
+        AudioDeviceInfo.TYPE_LINE_ANALOG
     )
     AudioDeviceInfo.TYPE_USB_DEVICE -> listOf(
         AudioDeviceInfo.TYPE_USB_DEVICE,
-        AudioDeviceInfo.TYPE_USB_HEADSET
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_LINE_ANALOG
     )
     AudioDeviceInfo.TYPE_USB_HEADSET -> listOf(
         AudioDeviceInfo.TYPE_USB_HEADSET,
-        AudioDeviceInfo.TYPE_USB_DEVICE
+        AudioDeviceInfo.TYPE_USB_DEVICE,
+        AudioDeviceInfo.TYPE_LINE_ANALOG
     )
     AudioDeviceInfo.TYPE_BLE_HEADSET -> listOf(AudioDeviceInfo.TYPE_BLE_HEADSET)
     else -> listOf(inputType)
@@ -1642,14 +2232,19 @@ internal fun selectCommunicationSink(
     if (candidates.isEmpty()) return null
 
     if (requested.address.isNotBlank()) {
-        return candidates.firstOrNull { it.address == requested.address }?.id
+        candidates.firstOrNull { it.address == requested.address }?.let { return it.id }
     }
     val isBuiltIn = requested.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
     if (!isBuiltIn && requested.name.isNotBlank()) {
-        return candidates.filter { it.name == requested.name }.singleOrNull()?.id
+        candidates.filter { it.name == requested.name }.singleOrNull()?.let { return it.id }
     }
 
-    return if (isBuiltIn || candidates.size == 1) candidates.first().id else null
+    val wiredOrUsb = requested.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+        requested.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+        requested.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+        requested.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+        requested.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+    return if (isBuiltIn || wiredOrUsb || candidates.size == 1) candidates.first().id else null
 }
 
 internal fun attemptCommunicationDeviceSelection(

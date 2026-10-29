@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.3] - 2026-10-29
+
+### Added
+
+- Added Android `AudioDeviceCallback` monitoring for Bluetooth, wired-headset, and USB input routes, with cached physical-device metadata for accurate user-visible names.
+- Added stable Bluetooth identifiers based on the headset address so a selection survives SCO endpoint recreation and OEM `AudioDeviceInfo` ID changes.
+- Added route tests for wired inputs whose playback endpoint is exposed as `TYPE_LINE_ANALOG`.
+
+### Changed
+
+- Android input selection now waits for Bluetooth HFP/SCO readiness and explicitly binds every new `AudioRecord` session to the latest resolved endpoint with `setPreferredDevice`.
+- Compressed `MediaRecorder` capture now resolves and binds the same selected input instead of independently falling back to the system microphone.
+- JavaScript device enumeration and refreshes are serialized so overlapping native device events cannot publish stale or incomplete inventories.
+
+### Fixed
+
+- Fixed external inputs appearing late or disappearing during active recording, duplicate insertion/removal events, generic Bluetooth/USB names, and false disconnects caused by OEM endpoint re-enumeration.
+- Fixed stale input IDs causing capture to fall back to the built-in microphone and fixed previous Bluetooth SCO routes remaining active while switching to wired or USB input.
+
 ## [4.0.2] - 2026-10-23
 
 ### Changed

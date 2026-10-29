@@ -146,23 +146,18 @@ class AudioStudioModule : Module(), EventSender, AudioStreamDecoderDelegate {
         
         // Selects a specific audio input device for recording
         AsyncFunction("selectInputDevice") { deviceId: String, promise: Promise ->
+            coroutineScope.launch {
             try {
                 LogUtils.d(CLASS_NAME, "selectInputDevice called with ID: $deviceId")
                 val requestedSession = audioRecorderManager.activeRecordingSession()
-                val selected = if (requestedSession == null) {
-                    audioDeviceManager.selectDeviceNow(deviceId)
-                } else {
-                    audioRecorderManager.runForActiveSession(requestedSession) {
-                        audioDeviceManager.selectDeviceNow(deviceId)
-                    } ?: false
-                }
+                val selected = audioDeviceManager.selectDevice(deviceId)
                 if (!selected) {
                     promise.reject(
                         "DEVICE_ERROR",
                         "Failed to select audio device $deviceId",
                         null
                     )
-                    return@AsyncFunction
+                    return@launch
                 }
                 if (requestedSession != null) {
                     audioRecorderManager.handleDeviceChange(requestedSession)
@@ -171,6 +166,7 @@ class AudioStudioModule : Module(), EventSender, AudioStreamDecoderDelegate {
             } catch (e: Exception) {
                 LogUtils.e(CLASS_NAME, "Error selecting input device: ${e.message}", e)
                 promise.reject("DEVICE_ERROR", "Failed to select audio device: ${e.message}", e)
+            }
             }
         }
         

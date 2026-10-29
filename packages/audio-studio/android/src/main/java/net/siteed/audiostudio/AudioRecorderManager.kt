@@ -1569,6 +1569,30 @@ class AudioRecorderManager(
                     return false
                 }
 
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    val inputs = manager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                    val requested = AudioInputRoutes.resolve(manager, selectedDeviceId)
+                    if (selectedDeviceId?.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX) == true && requested == null) {
+                        discardFailedAttempt()
+                        promise.reject("DEVICE_NOT_AVAILABLE", "Bluetooth input is not ready", null)
+                        return false
+                    }
+                    // A detached device must never leave recovery pointing at a stale ID.
+                    val input = requested ?: inputs.firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
+                    }
+                    if (input == null || !checkNotNull(audioRecord).setPreferredDevice(input)) {
+                        discardFailedAttempt()
+                        promise.reject("DEVICE_NOT_AVAILABLE", "Unable to select the recording input", null)
+                        return false
+                    }
+                    if (selectedDeviceId?.startsWith(AudioInputRoutes.BLUETOOTH_PREFIX) != true) {
+                        selectedDeviceId = input.id.toString()
+                    }
+                    LogUtils.d(CLASS_NAME, "Recording preferred input: ${input.productName} (ID: ${input.id}, type: ${input.type})")
+                }
+
                 // Rebuild the complete processing chain with each AudioRecord session. USB
                 // route changes and interruption recovery replace the Android session ID.
                 releaseVoiceProcessingEffects()
@@ -3098,6 +3122,12 @@ class AudioRecorderManager(
                 // Reuse the resolution the PCM path already made, so both outputs capture
                 // through the same source rather than resolving independently (#428).
                 setAudioSource(requireAudioSource.source)
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val input = AudioInputRoutes.resolve(manager, selectedDeviceId)
+                    ?: manager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
+                    }
+                check(input != null && setPreferredDevice(input)) { "Compressed recording input rejected" }
                 
                 // Choose output format based on codec and preferRawStream flag
                 val outputFormat = when (recordingConfig.output.compressed.format) {

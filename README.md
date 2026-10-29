@@ -10,6 +10,29 @@ This repository is a fork of the upstream [`deeeed/audiolab`](https://github.com
 
 ## Fork-specific changes
 
+### [4.0.3] - 2026-10-29
+
+#### Added
+
+- Added Android `AudioDeviceCallback` monitoring for Bluetooth, wired-headset, and USB input routes. Route callbacks are treated as the source of truth, while USB broadcasts preserve the physical device name and metadata until Android publishes the corresponding audio endpoint.
+- Added stable Bluetooth input identifiers based on the physical headset address (`bluetooth:<address>`). The selected headset now survives SCO endpoint removal and recreation instead of depending on a transient `AudioDeviceInfo.id`.
+- Added Bluetooth HEADSET-profile discovery and cached USB descriptors so device lists report the real headset or USB product name when an OEM exposes the tablet model, `h2w`, or another generic audio label.
+- Added routing coverage for wired inputs whose paired playback endpoint is reported as `TYPE_LINE_ANALOG` on Lenovo devices.
+
+#### Changed
+
+- Android input selection now waits for the Bluetooth HFP/SCO route and input endpoint to become ready before resolving the selection request. Android 12 and newer use `setCommunicationDevice`; earlier versions use Bluetooth SCO routing.
+- Every new `AudioRecord` session explicitly resolves the latest endpoint and calls `setPreferredDevice`. Compressed `MediaRecorder` capture uses the same selected input and rejects startup when Android refuses that route.
+- Device inventory refreshes are serialized in JavaScript. Native events that arrive during an active refresh schedule one final refresh instead of starting overlapping enumerations or dropping the latest device state.
+- Device enumeration no longer opens SCO or changes the selected route as a side effect.
+
+#### Fixed
+
+- Fixed external inputs appearing late or not appearing while recording by refreshing the inventory directly from Android route-change callbacks.
+- Fixed transient wired/USB removal notifications and selection fallback when an OEM re-enumerates the same physical device with a new endpoint ID. Equivalent replacement endpoints are reconciled during a short grace period.
+- Fixed Bluetooth microphones being displayed as the tablet model and stale input IDs causing capture to fall back to the built-in microphone after a route change.
+- Fixed switching away from Bluetooth leaving the previous SCO route active when Android had not yet published the new wired/USB playback endpoint.
+
 ### [4.0.2] - 2026-10-23
 
 #### Changed

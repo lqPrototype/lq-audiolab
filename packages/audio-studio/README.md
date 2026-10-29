@@ -1,269 +1,62 @@
-> Fork: https://github.com/deeeed/audiolab
+# audiolab
 
-**Give it a GitHub star, if you found this repo useful.**
+## Fork information
 
-Cross-platform audio recording, analysis, and processing for React Native and Expo. Mel spectrogram and spectral feature extraction run through a shared C++ layer on iOS, Android, and web (via WASM).
+This repository is a fork of the upstream [`deeeed/audiolab`](https://github.com/deeeed/audiolab) project.
 
-> Formerly `@siteed/expo-audio-studio`. See [MIGRATION.md](../../MIGRATION.md) for upgrade steps.
+- Upstream repository: [https://github.com/deeeed/audiolab](https://github.com/deeeed/audiolab)
+- This fork: [https://github.com/lqPrototype/lq-audiolab](https://github.com/lqPrototype/lq-audiolab)
+- The fork-specific Android audio changes documented below are maintained primarily in the `lq-audio-studio` package. The original project attribution, documentation, and license remain intact.
 
-<div align="center">
-  <div style="display: flex; justify-content: center; gap: 20px; margin: 30px 0;">
-    <div>
-      <h3>iOS</h3>
-      <img src="../../docs/ios.gif" alt="iOS Demo" width="280" />
-    </div>
-    <div>
-      <h3>Android</h3>
-      <img src="../../docs/android.gif" alt="Android Demo" width="280" />
-    </div>
-  </div>
+## Fork-specific changes
 
-  <p>
-    <a href="https://apps.apple.com/app/audio-playground/id6739774966">
-      <img src="https://developer.apple.com/app-store/marketing/guidelines/images/badge-download-on-the-app-store.svg" alt="App Store" height="40" />
-    </a>
-    <a href="https://play.google.com/store/apps/details?id=net.siteed.audioplayground">
-      <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Google Play" height="40" />
-    </a>
-  </p>
-  <p><a href="https://deeeed.github.io/audiolab/playground">Try the web demo</a></p>
-</div>
+### [4.0.3] - 2026-10-29
 
-## Features
+#### Added
 
-- **Recording** — real-time streaming, dual-stream (raw PCM + compressed), max active duration limits, background recording, zero-latency start via `prepareRecording`
-- **Device management** — list/select input devices (Bluetooth, USB, wired), automatic fallback
-- **Interruption handling** — auto pause/resume during phone calls
-- **Audio analysis** — MFCC, spectral features, mel spectrogram, tempo, pitch, waveform preview
-- **Native performance** — mel spectrogram and FFT-based features (MFCC, spectral centroid, etc.) computed in shared C++ on all platforms (JNI on Android, Obj-C++ bridge on iOS, WASM on web)
-- **Trimming** — precision cut with multi-segment support (keep or remove ranges)
-- **Notifications** — Android live waveform in notification, iOS media player integration
-- **Consistent format** — WAV PCM output across all platforms
+- Added Android `AudioDeviceCallback` monitoring for Bluetooth, wired-headset, and USB input routes. Route callbacks are treated as the source of truth, while USB broadcasts preserve the physical device name and metadata until Android publishes the corresponding audio endpoint.
+- Added stable Bluetooth input identifiers based on the physical headset address (`bluetooth:<address>`). The selected headset now survives SCO endpoint removal and recreation instead of depending on a transient `AudioDeviceInfo.id`.
+- Added Bluetooth HEADSET-profile discovery and cached USB descriptors so device lists report the real headset or USB product name when an OEM exposes the tablet model, `h2w`, or another generic audio label.
+- Added routing coverage for wired inputs whose paired playback endpoint is reported as `TYPE_LINE_ANALOG` on Lenovo devices.
 
-## Install
+#### Changed
 
-```bash
-yarn add @maiyuesfot/audio-studio
-```
+- Android input selection now waits for the Bluetooth HFP/SCO route and input endpoint to become ready before resolving the selection request. Android 12 and newer use `setCommunicationDevice`; earlier versions use Bluetooth SCO routing.
+- Every new `AudioRecord` session explicitly resolves the latest endpoint and calls `setPreferredDevice`. Compressed `MediaRecorder` capture uses the same selected input and rejects startup when Android refuses that route.
+- Device inventory refreshes are serialized in JavaScript. Native events that arrive during an active refresh schedule one final refresh instead of starting overlapping enumerations or dropping the latest device state.
+- Device enumeration no longer opens SCO or changes the selected route as a side effect.
 
-## Quick Start
+#### Fixed
 
-```typescript
-import { useAudioRecorder } from '@maiyuesfot/audio-studio'
+- Fixed external inputs appearing late or not appearing while recording by refreshing the inventory directly from Android route-change callbacks.
+- Fixed transient wired/USB removal notifications and selection fallback when an OEM re-enumerates the same physical device with a new endpoint ID. Equivalent replacement endpoints are reconciled during a short grace period.
+- Fixed Bluetooth microphones being displayed as the tablet model and stale input IDs causing capture to fall back to the built-in microphone after a route change.
+- Fixed switching away from Bluetooth leaving the previous SCO route active when Android had not yet published the new wired/USB playback endpoint.
 
-const { startRecording, stopRecording, isRecording } = useAudioRecorder()
+### [4.0.2] - 2026-10-23
 
-// Record
-await startRecording({
-    sampleRate: 44100,
-    channels: 1,
-    encoding: 'pcm_16bit',
-})
+#### Changed
 
-// ... later
-const result = await stopRecording()
-console.log('Saved to:', result.fileUri)
-```
+- Republished the Android 3A and WebRTC APM integration as version `4.0.2`; runtime behavior remains unchanged from `4.0.1`.
+- Documented the upstream fork origin and the maintained repository URL.
 
-### Zero-Latency Recording
+### [4.0.1] - 2026-10-23
 
-Pre-initialize to eliminate startup delay:
+#### Added
 
-```typescript
-const { prepareRecording, startRecording, stopRecording } =
-    useSharedAudioRecorder()
+- Added configurable Android 3A processing through `android.audioProcessing`. Callers can select `system`, `systemWithSoftwareFallback`, or `software` mode and independently enable echo cancellation, noise suppression, and automatic gain control.
+- Bundled an ARM64 WebRTC Audio Processing Module based on WebRTC Audio Processing 1.3. It provides AEC3, noise suppression, and AGC2 for mono PCM16 capture in 10 ms frames when the corresponding Android platform effect is unavailable or software processing is explicitly requested.
+- Added `audioProcessing` diagnostics to Android recording start results and status payloads. Each effect reports `disabled`, `system`, `webrtc`, or `unavailable`, together with the active sample rate, channel count, frame duration, and software-AEC reverse-stream state.
+- Added a native playback-reference entry point for software AEC. Software AEC is reported as active only after real speaker PCM reaches the WebRTC reverse stream; creating an AEC3 processor alone is not treated as successful echo cancellation.
 
-await prepareRecording({
-    sampleRate: 44100,
-    channels: 1,
-    encoding: 'pcm_16bit',
-})
+#### Changed
 
-// Later — starts instantly
-await startRecording()
-```
+- Android `voiceCommunication` capture now defaults to `systemWithSoftwareFallback`: verified platform AEC/NS/AGC effects remain preferred, while only effects that failed to attach are delegated to WebRTC APM.
+- WebRTC software processing is applied before primary WAV writes, JS PCM streaming, and audio analysis so all three consumers receive the same processed PCM. Android `MediaRecorder` compressed output remains on its separate capture path and is explicitly reported as unprocessed.
+- Platform effects and WebRTC processors are rebuilt for each new `AudioRecord` session, including USB route changes and interruption recovery, and are released together during recorder teardown.
 
-### Shared State Across Components
+### [4.0.0] - 2026-10-21
 
-```typescript
-const AudioApp = () => (
-  <AudioRecorderProvider>
-    <RecordButton />
-    <AudioVisualizer />
-  </AudioRecorderProvider>
-);
-```
+#### Added
 
-### Float32 Streaming (for ML / DSP)
-
-Set `streamFormat: 'float32'` to get `Float32Array` on all platforms instead of base64:
-
-```typescript
-await startRecording({
-    sampleRate: 16000,
-    channels: 1,
-    encoding: 'pcm_32bit',
-    streamFormat: 'float32',
-    onAudioStream: async (event) => {
-        const samples = event.data as Float32Array
-        await myModel.feed(samples)
-    },
-})
-```
-
-### Max Active Recording Duration
-
-Use `maxDurationMs` to cap cumulative active recording time. Paused time does
-not count toward the limit. By default, the recorder emits
-`onMaxDurationReached` and continues recording so your app can decide what to
-do next. Set `autoStopOnMaxDuration: true` to stop automatically.
-
-```typescript
-const {
-    startRecording,
-    maxDurationMs,
-    maxDurationReached,
-    lastRecordingReason,
-} = useAudioRecorder()
-
-await startRecording({
-    sampleRate: 16000,
-    channels: 1,
-    maxDurationMs: 60_000,
-    autoStopOnMaxDuration: true,
-    onMaxDurationReached: (event) => {
-        console.log('Reached recording limit:', event.maxDurationMs)
-    },
-    onRecordingStopped: (recording, reason) => {
-        if (reason === 'maxDuration') {
-            console.log('Auto-stopped recording:', recording.fileUri)
-        }
-    },
-})
-```
-
-When auto-stop is enabled, the max-duration event is emitted before the stop
-finishes. Use the event and stream callbacks for immediate UI updates, then use
-`onRecordingStopped` for the final `AudioRecording`, including `analysisData`
-when full-analysis retention is enabled. `lastRecordingReason` remains in React
-state so UI can explain why recording ended. Because hook auto-stop finalization
-runs after the native max-duration event is delivered to JS, keep the app/runtime
-active for background recording scenarios where the final stop result must be
-observed immediately.
-
-## Audio Analysis
-
-For live analysis during recording, `useAudioRecorder` keeps a recent analysis
-window in `analysisData` for visualization and, by default, also retains the
-full analysis history so `stopRecording().analysisData` can describe the whole
-recording. This option only matters when `enableProcessing: true`. For
-long-running sessions that only need live callbacks, disable the full-history
-retention to avoid unbounded JS memory growth:
-
-```typescript
-await startRecording({
-    sampleRate: 16000,
-    channels: 1,
-    enableProcessing: true,
-    keepFullAnalysis: false,
-    onAudioAnalysis: async (analysis) => {
-        // Consume each analysis chunk without retaining the full recording history.
-        updateVoiceActivity(analysis.dataPoints)
-    },
-})
-```
-
-```typescript
-import {
-    extractAudioAnalysis,
-    extractPreview,
-    extractMelSpectrogram,
-    trimAudio,
-} from '@maiyuesfot/audio-studio'
-
-// Feature extraction
-const analysis = await extractAudioAnalysis({
-    fileUri: 'path/to/recording.wav',
-    features: { rms: true, zcr: true, mfcc: true, spectralCentroid: true },
-})
-
-// Lightweight waveform for visualization
-const preview = await extractPreview({
-    fileUri: 'path/to/recording.wav',
-    pointsPerSecond: 50,
-})
-
-// Mel spectrogram for ML
-const mel = await extractMelSpectrogram({
-    fileUri: 'path/to/recording.wav',
-    nMels: 40,
-    hopLengthMs: 10,
-})
-
-// Trim audio
-const trimmed = await trimAudio({
-    fileUri: 'path/to/recording.wav',
-    ranges: [{ startTimeMs: 1000, endTimeMs: 5000 }],
-    mode: 'keep',
-})
-```
-
-### Which Method to Use
-
-| Method                  | Cost         | Use case                              |
-| ----------------------- | ------------ | ------------------------------------- |
-| `extractPreview`        | Light        | Waveform visualization                |
-| `extractRawWavAnalysis` | Light        | WAV metadata without decoding         |
-| `extractAudioData`      | Medium       | Raw PCM for custom processing         |
-| `extractAudioAnalysis`  | Medium-Heavy | MFCC, spectral features, pitch, tempo |
-| `extractMelSpectrogram` | Heavy        | Frequency-domain for ML               |
-
-## Docs
-
-- [Getting Started Guide](https://deeeed.github.io/audiolab/docs/)
-- [Contributing](./CONTRIBUTE.md)
-- [AudioPlayground](https://deeeed.github.io/audiolab/playground) — live demo of all features
-- [@siteed/audio-ui](https://github.com/deeeed/audiolab/tree/main/packages/audio-ui) — waveform, spectrogram, and audio control components
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-<sub>Created by [Arthur Breton](https://siteed.net)</sub>
-
-### Compact waveform preview bars
-
-For UI waveform previews, prefer `extractPreviewBars` over adapting a full
-`AudioAnalysis` when detailed features are not needed:
-
-```typescript
-import { extractPreviewBars } from '@maiyuesfot/audio-studio'
-
-const preview = await extractPreviewBars({
-    fileUri,
-    numberOfBars: 120,
-    startTimeMs: 0,
-    endTimeMs: 30_000,
-})
-
-console.log(preview.bars, preview.durationMs, preview.amplitudeRange)
-```
-
-`extractPreviewBars` returns compact `PreviewBar[]` data plus duration, sample
-rate, channel count, bit depth, amplitude/RMS ranges, and extraction timing. The
-existing `extractPreview` API remains available for compatibility with callers
-that expect `AudioAnalysis` / `DataPoint[]`.
-
-Native Android and iOS expose an `extractPreviewBars` bridge for compact
-bars-out results. JS also keeps a compatibility fallback through `extractPreview`
-for older native runtimes that do not yet provide the compact bridge.
-
-#### C++ scope note
-
-Waveform preview bar extraction intentionally keeps file decode in platform
-code. A future C++ `WaveformBarsProcessor` should be considered only as a pure
-PCM-in/bars-out processor if Kotlin/Swift/Web implementations become a real
-maintenance problem or if waveform bars are bundled into a broader shared
-processor/VAD effort. This is not a formal benchmark claim.
+- Android `audioSource: 'voiceCommunication'` now opens `VOICE_COMMUNICATION` capture and explicitly attaches every available platform AEC, noise-suppression, and automatic-gain-control effect to the `AudioRecord` session. Each effect is checked and enabled independently, logged with its OEM implementation, released before the recorder, and safely skipped when unsupported or rejected by the device. Effects are reattached when Android rebuilds capture after a route change or interruption.

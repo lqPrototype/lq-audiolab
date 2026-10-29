@@ -113,6 +113,33 @@ class AudioDeviceRoutingTest {
         assertEquals(21, selectCommunicationSink(requested, sinks))
     }
 
+    @Test
+    fun `wired input can be resolved before its communication sink is ready`() {
+        val requested = descriptor(
+            10,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            "",
+            "Wired Headset"
+        )
+
+        assertNull(selectCommunicationSink(requested, emptyList()))
+    }
+
+    @Test
+    fun `wired input selects line analog playback sink`() {
+        val requested = descriptor(
+            10,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            "",
+            "Wired Headset"
+        )
+        val sinks = listOf(
+            descriptor(21, AudioDeviceInfo.TYPE_LINE_ANALOG, "", "Headset Line")
+        )
+
+        assertEquals(21, selectCommunicationSink(requested, sinks))
+    }
+
     private fun descriptor(
         id: Int,
         type: Int,

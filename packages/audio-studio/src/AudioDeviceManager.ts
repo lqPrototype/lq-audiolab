@@ -84,7 +84,10 @@ export class AudioDeviceManager {
         new Set()
     private webDeviceChangeHandler?: () => void
     private lastRefreshTime: number = 0
-    private refreshInProgress: boolean = false
+    private refreshTask: Promise<AudioDevice[]> | null = null
+    private refreshAgain = false
+    private enumerationTask: Promise<AudioDevice[]> | null = null
+    private nativeSubscription?: { remove: () => void }
     private refreshDebounceMs: number = 500 // Minimum 500ms between refreshes
     private logger?: ConsoleLike
 
@@ -117,28 +120,8 @@ export class AudioDeviceManager {
      * Set up native device event listener for iOS/Android
      */
     private setupNativeDeviceEventListener(): void {
-        // Store the last event type to avoid duplicates
-        let lastEventType: string | null = null
-        let lastEventTime = 0
-
-        this.eventEmitter.addListener('deviceChangedEvent', (event: any) => {
-            // Skip processing duplicate events that occur too close together
-            const now = Date.now()
-            const isSimilarEvent =
-                lastEventType === event.type &&
-                now - lastEventTime < this.refreshDebounceMs
-
-            if (isSimilarEvent) {
-                this.logger?.debug(
-                    `Skipping similar device event (${event.type}) received too soon`
-                )
-                return
-            }
-
-            // Update the last event tracking
-            lastEventType = event.type
-            lastEventTime = now
-
+        this.nativeSubscription?.remove()
+        this.nativeSubscription = this.eventEmitter.addListener('deviceChangedEvent', (event: any) => {
             // Only refresh on meaningful events
             if (
                 event.type === 'deviceConnected' ||
@@ -206,9 +189,18 @@ export class AudioDeviceManager {
      * @param options Optional settings to force refresh the device list. Can include a refresh flag.
      * @returns Promise resolving to an array of audio devices conforming to AudioDevice interface
      */
-    async getAvailableDevices(options?: {
+    getAvailableDevices(options?: {
         refresh?: boolean
     }): Promise<AudioDevice[]> {
+        if (this.enumerationTask) return this.enumerationTask
+        const task = this.enumerateDevices(options).finally(() => {
+            if (this.enumerationTask === task) this.enumerationTask = null
+        })
+        this.enumerationTask = task
+        return task
+    }
+
+    private async enumerateDevices(options?: { refresh?: boolean }): Promise<AudioDevice[]> {
         try {
             if (Platform.OS === 'web') {
                 this.availableDevices = await this.getWebAudioDevices()
@@ -447,6 +439,8 @@ export class AudioDeviceManager {
      * Clean up timeouts and listeners (useful for testing or cleanup)
      */
     cleanup(): void {
+        this.nativeSubscription?.remove()
+        this.nativeSubscription = undefined
         // Clear all disconnection timeouts
         this.disconnectionTimeouts.forEach((timeout) => clearTimeout(timeout))
         this.disconnectionTimeouts.clear()
@@ -474,24 +468,21 @@ export class AudioDeviceManager {
      * @returns Promise resolving to the updated device list (AudioDevice[])
      */
     async forceRefreshDevices(): Promise<AudioDevice[]> {
-        this.logger?.debug('Force refreshing devices (bypassing debounce)...')
-        this.refreshInProgress = true
-        try {
-            // Force fetch the latest devices from native layer
-            const devices = await this.getAvailableDevices({ refresh: true })
-            // Update internal state
-            this.availableDevices = devices
-            // Notify listeners with fresh data
-            this.notifyListeners()
-            this.lastRefreshTime = Date.now()
-            return devices
-        } catch (error) {
-            this.logger?.error('Error during forceRefreshDevices:', error)
+        this.refreshAgain = true
+        if (this.refreshTask) return this.refreshTask
+        const task = (async () => {
+            do {
+                this.refreshAgain = false
+                await this.getAvailableDevices({ refresh: true })
+                this.notifyListeners()
+                this.lastRefreshTime = Date.now()
+            } while (this.refreshAgain)
             return this.availableDevices
-        } finally {
-            this.refreshInProgress = false
-            this.logger?.debug('Force refresh finished.')
-        }
+        })().finally(() => {
+            if (this.refreshTask === task) this.refreshTask = null
+        })
+        this.refreshTask = task
+        return task
     }
 
     /**
@@ -501,10 +492,7 @@ export class AudioDeviceManager {
     async refreshDevices(): Promise<AudioDevice[]> {
         const now = Date.now()
 
-        if (this.refreshInProgress) {
-            this.logger?.debug('Refresh already in progress, skipping')
-            return this.availableDevices
-        }
+        if (this.refreshTask) return this.refreshTask
 
         // Always allow refresh if forced by native event or longer than 2s debounce
         const timeSinceLastRefresh = now - this.lastRefreshTime
@@ -519,22 +507,7 @@ export class AudioDeviceManager {
             return this.availableDevices
         }
 
-        this.logger?.debug('Refreshing devices...')
-        this.refreshInProgress = true
-        try {
-            // Fetch the latest devices; getAvailableDevices handles mapping now
-            const devices = await this.getAvailableDevices({ refresh: true })
-            // availableDevices state is updated within getAvailableDevices
-            this.notifyListeners() // Notify listeners with the updated list
-            this.lastRefreshTime = Date.now()
-            return devices // Return the fetched & mapped list
-        } catch (error) {
-            this.logger?.error('Error during refreshDevices:', error)
-            return this.availableDevices // Return potentially stale list on error
-        } finally {
-            this.refreshInProgress = false
-            this.logger?.debug('Refresh finished.')
-        }
+        return this.forceRefreshDevices()
     }
 
     /**
